@@ -183,6 +183,9 @@ it('names only the program and how it ended when a command prints no diagnostics
 })
 it('reports failures as CliError with the code the CLI names and the exit status', async () => {
   const notFound = commandError({ stderr: 'gh: Not Found (HTTP 404)\n', code: 1 })
+  // A shell that caught a signal reports 128 + N; Windows has no signal to report.
+  expect(commandError({ code: 143 })).toMatchObject({ message: 'command was stopped by SIGTERM' })
+  expect(commandError({ code: 124 })).toMatchObject({ message: 'command exited with code 124' })
   expect(notFound).toBeInstanceOf(CliError)
   expect(notFound).toMatchObject({ message: 'gh: Not Found (HTTP 404)', code: 404, exitCode: 1 })
   expect(commandError({ stderr: JSON.stringify({ error: { code: 230011, message: 'The message is recalled' } }),

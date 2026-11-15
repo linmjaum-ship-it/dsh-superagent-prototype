@@ -152,6 +152,21 @@ it('points a setup problem at the settings that fix it', async () => {
   expect(text()).toContain('部署检查未通过：git 没有读取 dsh-superagent 为 github.com 写的凭据配置')
 })
 
+it('reads a rearm the runtime scheduled as recovery, not as a problem waiting for a person', async () => {
+  // A setup retry that ran out leaves a rearm behind: the wait ends without anyone restarting dsh-superagent.
+  const dueAt = new Date(Date.now() + 300_000).toISOString()
+  server.setup = { ...server.setup, problem: problemOf('agentCliSignedOut'), accounts: null, rearm: { dueAt } }
+  await mount()
+  expect(text()).toContain(zh.problemSetup)
+  expect(text()).toContain('自愈中：')
+  expect(text()).toContain('自动重跑部署检查，无需手动重启')
+  expect(text()).not.toContain(zh['problemSetupFix.github'])
+  // Without a rearm the same problem asks for the fix again.
+  server.setup = { ...server.setup, rearm: null }
+  await remount()
+  expect(text()).toContain(zh['problemSetupFix.github'])
+})
+
 it('shows a failed Feishu bot check as a problem of the Feishu Source only, with a check after a fix outside dsh-superagent', async () => {
   server.setup = { ...server.setup, feishuProblem: problemOf('feishuBotNotReady', { app: 'cli_bot', status: 'missing' }),
     accounts: { ...server.setup.accounts!, feishu: null } }

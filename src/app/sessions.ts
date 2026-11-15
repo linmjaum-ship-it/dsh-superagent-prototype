@@ -13,6 +13,9 @@ import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
+import { approvalRefusal, refusedRefusal, shellRefusal, shellRule } from './command-gate.ts'
+import { renderFacts, type FactCards } from './facts.ts'
+import { WakeProbe } from './wake-probe.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
@@ -29,6 +32,20 @@ export interface SessionsHost {
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
+  /** The `wake` health entry, which reports a main Session whose wakes the host refuses before any model request. */
+  readonly wake: HealthEntry
+  /** Called once per blocked wake, after `wake` reports it, so the host may repair the main Session. */
+  readonly onBlockedWake?: (detail: string) => void
+  /** The fact cards a ticket keeps, re-injected on every request so a compressed history never loses its bounds. */
+  readonly facts?: Pick<FactCards, 'peek'>
+  /** Called for every session event, so the host may total what each model request cost. */
+  readonly onUsage?: (sessionId: string, role: 'main' | 'worker', event: { type: string; time: number; data: unknown }) => void
+  /** Called when the command gate refuses a worker's shell command, so the person who asked learns why. */
+  readonly alert?: (detail: { ticketId: string; rule: string; command: string; approvable: boolean; refused?: boolean }) => void
+  /** Whether a person approved this rule for this ticket, which lets the one command it names run. */
+  readonly approved?: (ticketId: string, rule: string) => boolean
+  /** Whether a person refused this rule for this ticket, which keeps the command refused without a new card. */
+  readonly refused?: (ticketId: string, rule: string) => boolean
   readonly masterId: string
   readonly lifetime: AbortSignal
   closing(): boolean
@@ -76,7 +93,7 @@ const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|
  */
 function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
   const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
-  if (name === 'bash') {
+  if (name === 'bash' || name === 'pwsh') {
     const sleeps = typeof args.command === 'string' && SLEEP.test(args.command)
     if (sleeps || typeof args.timeoutMs === 'number' && args.timeoutMs > 30_000) return NO_WAIT
     if (args.timeoutMs === undefined && args.run_in_background !== true && !routed()) return DEFAULT_WAIT
@@ -95,10 +112,12 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  private readonly wakeProbe: WakeProbe
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
+    this.wakeProbe = new WakeProbe(host.masterId)
     this.agentDelivery = new AgentDelivery(host.context)
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
@@ -112,10 +131,12 @@ export class Sessions {
       this.retryHealth.clear(agent.id); this.updateModelHealth()
     })
     ctx.on('session/event', (session, event) => {
+      this.host.onUsage?.(session.id, session.id === this.host.masterId ? 'main' : 'worker', event)
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
+      this.observeWake(agent.id, event)
       this.updateModelHealth()
     })
     ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
@@ -163,6 +184,9 @@ export class Sessions {
     accepted?: () => void): Promise<void> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
+    // A Session restored from disk after a restart carries no prompt section of ours yet, and compaction rebuilds the
+    // system prompt from whatever is registered, so decorate before the request that reads it.
+    await this.decorate(result.agent)
     await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
@@ -225,6 +249,18 @@ export class Sessions {
       ? { state: 'error', detail: retries.slice(0, 5).map(item => `${item.sessionId}: ${item.provider} is over its model budget; retried ${item.attempts} times, waiting since ${item.since}; the model and retry policy are unchanged`).join('; ') + (retries.length > 5 ? `; ${retries.length - 5} more Sessions` : ''), at: retries.at(-1)!.lastAt }
       : { state: 'ready', detail: 'No managed Session is waiting on a model budget retry' })
   }
+  /** Mirrors the main Session's wake verdict into the `wake` health entry: a refused wake is an error until a turn reaches the model again. */
+  private observeWake(sessionId: string, event: Parameters<WakeProbe['observe']>[1]): void {
+    const verdict = this.wakeProbe.observe(sessionId, event)
+    if (verdict === undefined) return
+    if (verdict === 'blocked') {
+      const detail = `${this.wakeProbe.detail ?? 'A wake ended without a model request'}; the main Session accepts no work`
+      this.host.wake.set({ state: 'error', detail, at: new Date(event.time).toISOString() })
+      this.host.onBlockedWake?.(detail)
+      return
+    }
+    this.host.wake.set({ state: 'ready', detail: 'Every wake reached the model', at: new Date(event.time).toISOString() })
+  }
   private ticketOf(agent: Agent): Ticket | undefined {
     const ticketId = ticketOfSession(agent.id)
     return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
@@ -240,6 +276,9 @@ export class Sessions {
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
     this.updateModelHealth()
+    // The ticket's facts outlive its history: this section is rebuilt on every request, so a compacted Session reads it again.
+    if (ticket && host.facts) binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-facts', order: 9000,
+      interpolate: false, text: () => { const facts = host.facts?.peek(ticket.id); return facts ? renderFacts(facts) : '' } }))
     // Disable variable interpolation so literal ${{ ... }} expressions in team prompts are preserved.
     binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
       const version = this.promptFor(agent, context.signal !== undefined)
@@ -260,12 +299,37 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+      // Windows profiles ship the pwsh tool, not bash; restrict to the shell this host actually has.
+      const shell = process.platform === 'win32' ? 'pwsh' : 'bash'
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', shell, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
     }
+  }
+  /**
+   * A worker's guard for shell calls: a command line that pipes a download into an interpreter, fetches a script, force
+   * pushes, or deletes a repository is refused before it runs, and the person who asked is told which rule refused it.
+   */
+  private gateShell(ticketId: string, execution: Readonly<{ name?: string; arguments?: unknown }> | undefined): string | undefined {
+    const name = execution?.name ?? ''
+    const input = execution?.arguments
+    const rule = shellRule(name, input)
+    if (rule === undefined) return undefined
+    const command = (input as { command?: unknown } | undefined)?.command
+    const text = typeof command === 'string' ? command.slice(0, 500) : ''
+    // An approval covers the one command it was asked for, and is spent when this check lets it through.
+    if (rule.approvable === true) {
+      if (this.host.approved?.(ticketId, rule.id) === true) return undefined
+      // A refusal stands without asking again: a card per attempt would train the worker to keep knocking.
+      if (this.host.refused?.(ticketId, rule.id) === true) {
+        this.host.alert?.({ ticketId, rule: rule.id, command: text, approvable: false, refused: true })
+        return refusedRefusal(name, input)
+      }
+    }
+    this.host.alert?.({ ticketId, rule: rule.id, command: text, approvable: rule.approvable === true })
+    return rule.approvable === true ? approvalRefusal(name, input) : shellRefusal(name, input)
   }
   /**
    * Whether a Session runs the router preset: as DSH's preset registry last selected it, read through the session projection
@@ -290,9 +354,9 @@ export class Sessions {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(execution => {
       const current = store.tickets.get(ticketId)
-      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
+      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : this.gateShell(ticketId, execution)
     })]
   }
   /**

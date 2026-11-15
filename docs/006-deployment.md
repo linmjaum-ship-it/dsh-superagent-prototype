@@ -140,6 +140,27 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 `--respect-stop` preserves an intentional stop. Only `stop` writes the marker; `start` clears it. `restart` writes no marker, so the check can recover a restart whose shutdown timed out.
 
+### Windows: a logon task or a service
+
+`scripts/dsh-superagent` needs bash and tmux, so on Windows use `scripts/dsh-superagent-service.ps1` instead. It installs one of two things around the same start command, `dsh --profile superagent --no-open`:
+
+```powershell
+powershell -NoProfile -File scripts/dsh-superagent-service.ps1 -Action plan
+```
+
+`plan` prints the commands an install would run and changes nothing. Read them before installing:
+
+- `-Method task` (the default) registers the per-user scheduled task `DshSuperAgent`, triggered at logon. It needs no administrator rights, and it starts no earlier than the logon.
+- `-Method service` installs a Windows service through WinSW (`-WinSW <path to winsw.exe>`), which needs an elevated shell. WinSW reads the XML beside `winsw.exe`; that file must name `DshSuperAgent` and repeat the same start command.
+
+```powershell
+powershell -NoProfile -File scripts/dsh-superagent-service.ps1 -Action install -Method task
+powershell -NoProfile -File scripts/dsh-superagent-service.ps1 -Action status
+powershell -NoProfile -File scripts/dsh-superagent-service.ps1 -Action uninstall
+```
+
+`status` prints one line, `target=DshSuperAgent registered=… running=… port=3082 listening=… state=…`, where `state=http 200` means the management API answered `/orchestrator/api/state`. It exits 0 only when the profile is both registered and answering. `install`, `start`, `stop` and `uninstall` print each command with a `+ ` prefix before running it.
+
 ## Settings
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.

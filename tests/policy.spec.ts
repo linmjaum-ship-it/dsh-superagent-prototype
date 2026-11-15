@@ -87,6 +87,18 @@ describe('gate', () => {
     expect(policy.gate(unaddressed({ meta: { chatId: CHAT, direct: false, mentioned: false } }), thread(), [])).toEqual({ admissible: false, reason: 'no_mention' })
   })
 })
+describe('routine triggers', () => {
+  const routine = (routineId = 'routine-1'): Trigger => ({ id: 'r', source: 'routine', threads: [{ source: 'routine', id: routineId }],
+    actor: { source: 'routine', id: routineId }, human: false, at: '', text: 'Review the open pull requests', meta: { routine: routineId } })
+  it('admits a Routine as an inferred candidate while proactive work is on, and nothing while it is off', () => {
+    expect(policy.gate(routine(), thread(), [])).toMatchObject({ admissible: true, strength: 'inferred',
+      basis: { via: 'admission', cell: 'unlistedUnaddressed', source: 'routine', observation: { mode: 'auto' } } })
+    const observe = setup({ ...base, eval: { ...base.eval, mode: 'observe' } }).policy
+    expect(observe.gate(routine(), thread(), [])).toMatchObject({ admissible: true, strength: 'inferred', basis: { observation: { mode: 'observe' } } })
+    const off = setup({ ...base, eval: { ...base.eval, mode: 'off' } }).policy
+    expect(off.gate(routine(), thread(), [])).toEqual({ admissible: false, reason: 'admission_ignored' })
+  })
+})
 describe('admission table', () => {
   const STRANGER = 'ou_stranger'
   const withTable = (admission: Record<string, Record<string, string>>, config: Record<string, unknown> = {}, mode: 'off' | 'observe' | 'auto' = 'auto') => SettingsSchema.parse({ ...base,

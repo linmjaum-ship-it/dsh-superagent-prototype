@@ -96,3 +96,34 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
 })
+
+it('compacts one Ticket\'s Session on demand, and answers a missing Ticket or a host without compaction', async () => {
+  const compacted: string[] = []
+  const call = serve({
+    store: { tickets: { get: (id: string) => id === 't1' ? { id } : undefined } },
+    compactTicket: async (id: string) => { compacted.push(id); return { compacted: true } },
+  })
+  expect(await call('POST', 'tickets/t1/compact')).toEqual({ status: 200, body: { compacted: true } })
+  expect(compacted).toEqual(['t1'])
+  expect(await call('POST', 'tickets/nope/compact')).toEqual({ status: 404, body: { error: 'Ticket not found' } })
+  const failing = serve({
+    store: { tickets: { get: () => ({ id: 't1' }) } },
+    compactTicket: async () => { throw new Error('Ticket t1 has no Session to compact') },
+  })
+  expect(await failing('POST', 'tickets/t1/compact'))
+    .toEqual({ status: 500, body: { error: 'Ticket t1 has no Session to compact' } })
+})
+
+it('opens one turn on a Ticket\'s Session for diagnostics, and answers a missing Ticket', async () => {
+  const prompted: Array<{ id: string; text: string }> = []
+  const call = serve({
+    store: { tickets: { get: (id: string) => id === 't1' ? { id } : undefined } },
+    promptTicket: async (id: string, text: string) => { prompted.push({ id, text }); return { prompted: true } },
+  })
+  expect(await call('POST', 'tickets/t1/prompt', { text: 'say one sentence' }))
+    .toEqual({ status: 200, body: { prompted: true } })
+  expect(prompted).toEqual([{ id: 't1', text: 'say one sentence' }])
+  expect(await call('POST', 'tickets/nope/prompt', { text: 'say one sentence' }))
+    .toEqual({ status: 404, body: { error: 'Ticket not found' } })
+  expect(await call('POST', 'tickets/t1/prompt', {})).toEqual({ status: 400, body: { error: 'A prompt needs text to send' } })
+})

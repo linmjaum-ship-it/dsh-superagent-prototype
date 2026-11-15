@@ -36,6 +36,41 @@ it('offers to send a person\'s message that reached a ticket to Eval, for one it
   expect(server.requests.some(request => request.path === 'triggers/e3/requeue' && request.method === 'POST')).toBe(true)
 })
 
+it('lists the approvals asked for a subscribed Ticket, with who decided and when', async () => {
+  server.threadPages = () => ({ ...threadSummary(), tickets: [], correlated: [], decisions: [], context: [], url: undefined,
+    approvals: [{ id: 'a1', ticketId: 't1', rule: 'force_push', command: 'git push --force origin main', state: 'approved',
+      askedAt: '2026-09-23T00:00:00Z', expiresAt: '2026-09-23T00:10:00Z', decidedAt: '2026-09-23T00:02:00Z', decidedBy: 'Alice' }],
+    timeline: [trigger('x1', '2026-09-23T00:00:00Z')], earlier: null })
+  await mount()
+  await click(zh['tab.trigger'])
+  await click('这个文案好奇怪')
+  expect(text()).toContain('这个线程的审批 · 1')
+  await click(zh.threadApprovals.replace('{count}', '1'))
+  expect(text()).toContain('已批准')
+  expect(text()).toContain('force_push')
+  expect(text()).toContain('git push --force origin main')
+  expect(text()).toContain('Alice')
+})
+
+it('answers a pending approval from its Thread page, then shows the decision the reload returns', async () => {
+  server.approvals = [{ id: 'a1', ticketId: 't1', rule: 'force_push', command: 'git push --force origin main', state: 'pending',
+    askedAt: '2026-09-23T00:00:00Z', expiresAt: '2026-09-23T00:10:00Z' }]
+  server.threadPages = () => ({ ...threadSummary(), tickets: [], correlated: [], decisions: [], context: [], url: undefined,
+    approvals: server.approvals ?? [], timeline: [trigger('x1', '2026-09-23T00:00:00Z')], earlier: null })
+  await mount()
+  await click(zh['tab.trigger'])
+  await click('这个文案好奇怪')
+  await click(zh.threadApprovals.replace('{count}', '1'))
+  expect(text()).toContain('等待回答')
+  await click(zh.approve)
+  expect(server.requests.some(request => request.path === 'approvals/a1/decide' && request.method === 'POST'
+    && JSON.stringify(request.body) === '{"answer":"approve"}')).toBe(true)
+  await settle()
+  expect(text()).toContain('已批准')
+  expect(text()).toContain('面板')
+  expect(text()).not.toContain('等待回答')
+})
+
 it('filters the Thread list by activity, and unsubscribes from a Thread page after confirmation', async () => {
   await mount()
   await click(zh['tab.trigger'])
@@ -52,7 +87,7 @@ it('filters the Thread list by activity, and unsubscribes from a Thread page aft
 it('folds consecutive automated messages from one sender on a Thread, showing the newest with its text', async () => {
   const bot = (id: string, at: string) => trigger(id, at, { actor: { source: 'github', id: '' }, human: false,
     text: `CI of PR #42 at abc1234: 3 checks, 0 failed, ${id === 'b3' ? 0 : 1} running.`, preview: `CI ${id}` })
-  server.threadPages = () => ({ ...threadSummary(), tickets: [], correlated: [], decisions: [], earlier: null, context: [],
+  server.threadPages = () => ({ ...threadSummary(), tickets: [], correlated: [], decisions: [], approvals: [], earlier: null, context: [],
     timeline: [bot('b1', '2026-09-23T00:00:00Z'), bot('b2', '2026-09-23T00:01:00Z'), trigger('h1', '2026-09-23T00:02:00Z'), bot('b3',
       '2026-09-23T00:03:00Z'), bot('b4', '2026-09-23T00:04:00Z')] })
   await mount()
@@ -77,7 +112,7 @@ it('reads the page around a link\'s target once, also for a Trigger the Thread d
 
 it('shows a follow-up delivered to its Ticket without an Eval, a hand-back with why, and a Ticket that follows the Thread for context', async () => {
   server.threadPages = () => ({ ...threadSummary(), tickets: [ticketSummary(), ticketSummary({ id: 't2', title: '相关工单' })],
-    correlated: [], decisions: [], earlier: null, context: ['t2'], url: undefined,
+    correlated: [], decisions: [], approvals: [], earlier: null, context: ['t2'], url: undefined,
     timeline: [trigger('f1', '2026-09-23T00:00:00Z', { disposition: { delivered: true, fanout: ['t1'] } }),
       trigger('f2', '2026-09-23T00:01:00Z', { disposition: { queued: true, fanout: ['t1'], handbacks: [{ ticketId: 't1', title: '修复回归',
         reason: 'Asks for a new page', at: '2026-09-23T00:02:00Z' }] } })] })
@@ -105,7 +140,7 @@ function busyThread(count: number) {
     const end = around ? thread.triggers.find(item => item.id === around)?.at : undefined
     const kept = thread.triggers.filter(item => end ? item.at <= end : !before || item.at < before)
     const timeline = kept.slice(-50)
-    return { ...threadSummary(), tickets: [], correlated: [], decisions: [], context: [], url: undefined, timeline,
+    return { ...threadSummary(), tickets: [], correlated: [], decisions: [], approvals: [], context: [], url: undefined, timeline,
       earlier: kept.length > 50 ? timeline[0]!.at : null }
   }
   return thread

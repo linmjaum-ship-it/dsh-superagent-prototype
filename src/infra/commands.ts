@@ -1,9 +1,11 @@
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
 import { execFile } from 'node:child_process'
 import { basename } from 'node:path'
+import { constants as osConstants } from 'node:os'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
+import { blockedCommand } from '../app/command-gate.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
@@ -30,12 +32,17 @@ export function commandError(error: unknown, program = 'command'): Error {
   }
   return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)
 }
+/** POSIX shells report a signal as the exit code 128 + N, which is all Windows ever reports. */
+const signals: Record<number, string> = Object.fromEntries(Object.entries(osConstants.signals).map(([name, number]: [string, number]) => [number, name]))
 function ended(error: unknown): string {
   const { killed, signal, code } = (error ?? {}) as { killed?: boolean; signal?: string | null; code?: unknown }
   if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'printed more output than it may'
   // `execFile` timeout terminates the process with SIGTERM and sets `killed: true`.
   if (killed && signal === 'SIGTERM') return `timed out after ${TIMEOUT_MS / 1000} s`
   if (signal) return `was stopped by ${signal}`
+  // A shell that caught the signal reports 128 + N instead; Windows always reports the code this way.
+  const caught = typeof code === 'number' ? signals[code - 128] : undefined
+  if (caught) return `was stopped by ${caught}`
   if (typeof code === 'number') return `exited with code ${code}`
   return typeof code === 'string' ? `could not run: ${code}` : 'failed'
 }
@@ -61,11 +68,15 @@ export class Commands {
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
    * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
    */
-  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
+  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal,
+    /** Commands this installation refuses, read at each call: a path or a suffix does not get around the shims. */
+    private readonly blocked: () => readonly string[] = () => []) {}
   get deployment(): Deployment { return this.resolved() }
   get repository(): string { return this.deployment.repository }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
+    const name = blockedCommand(program, this.blocked())
+    if (name !== undefined) throw new CliError(`${name} is blocked in this installation`, 1)
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
         env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })

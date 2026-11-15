@@ -4,7 +4,7 @@ import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
-import { SetupError, type SetupProblem } from '../setup.ts'
+import { SetupError, type SetupCode, type SetupProblem } from '../setup.ts'
 
 export interface SetupHost {
   readonly context: Context
@@ -13,6 +13,32 @@ export interface SetupHost {
   restart(): void
 }
 
+/** Setup problems a passing network condition causes: another attempt may succeed where the operator cannot act. */
+const PASSING: ReadonlySet<SetupCode> = new Set<SetupCode>(['agentCliSignedOut'])
+/** What a lost connection looks like in a CLI's own output, as opposed to the refusal the operator must act on. */
+const NETWORK = /dial tcp|connectex|i\/o timeout|TLS handshake timeout|no such host|connection reset|connection refused|broken pipe|unexpected EOF|http2: client connection lost/i
+/**
+ * Whether a passing network may be the cause. A sign-out is retried because the probe cannot tell a real one from a lost
+ * connection; every other problem is judged by what the CLI printed, so a refusal like a missing permission is not.
+ */
+export function passingSetup(error: SetupError): boolean {
+  return PASSING.has(error.code) || NETWORK.test(error.values.output ?? '')
+}
+/** Waits before each retry of a passing setup problem; a sign-out that does not pass still stops after the last wait. */
+const DEFAULT_RETRY_MS: readonly number[] = [2_000, 8_000]
+/** Retry waits for setup, read from `DSH_SUPERAGENT_SETUP_RETRY_MS` (comma separated) so a test need not wait ten seconds. */
+export function setupRetryMs(raw: string | undefined = process.env.DSH_SUPERAGENT_SETUP_RETRY_MS): readonly number[] {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_RETRY_MS
+  return raw.split(',').map(part => Number.parseInt(part.trim(), 10)).filter(ms => Number.isFinite(ms) && ms >= 0)
+}
+/** A setup problem a passing network keeps causing is re-run on this wait, so an outage that outlasts the retries heals itself. */
+const DEFAULT_REARM_MS = 300_000
+/** Rearm wait, read from `DSH_SUPERAGENT_SETUP_REARM_MS`; `0` turns the rearm off. */
+export function setupRearmMs(raw: string | undefined = process.env.DSH_SUPERAGENT_SETUP_REARM_MS): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_REARM_MS
+  const ms = Number.parseInt(raw.trim(), 10)
+  return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_REARM_MS
+}
 const setupFields = (settings: Settings) =>
   JSON.stringify(Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? '')))
 export const setupChanged = (before: Settings, after: Settings): boolean => setupFields(before) !== setupFields(after)
@@ -30,6 +56,14 @@ export class Setup {
   /** Environment variables pointing agent subprocesses at the isolated git config and command shims. */
   private readonly variables: Record<string, string | undefined>
   private restoreEnvironment?: () => void
+  /** Waits before each retry of a passing setup problem, read once so a restart reads the current setting. */
+  private readonly retry: readonly number[] = setupRetryMs()
+  /** How long a setup problem a passing network keeps causing waits before the runtime runs setup again, read once. */
+  private readonly rearmMs: number = setupRearmMs()
+  /** Set while a rearm is scheduled, so retries that fail in a row do not stack timers. */
+  private rearmed = false
+  /** When the scheduled rearm fires, so the panel can tell a self-healing wait from a runtime that died on setup. */
+  private rearmAt?: number
   constructor(private readonly host: SetupHost) {
     this.path = withoutDirectory(process.env.PATH ?? '', workerBin(host.machine.stateDir))
     this.variables = agentVariables(host.machine.stateDir)
@@ -43,12 +77,59 @@ export class Setup {
   configured(): boolean { return this.resolved !== undefined }
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
   async run(settings: Settings): Promise<boolean> {
-    try { this.resolved = await this.resolve(settings); return true }
-    catch (error) {
-      if (!(error instanceof SetupError)) throw error
-      this.problem = error.problem
-      return false
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        this.resolved = await this.resolve(settings)
+        this.problem = undefined
+        this.rearmAt = undefined
+        return true
+      } catch (error) {
+        if (!(error instanceof SetupError)) throw error
+        this.problem = error.problem
+        const wait = this.retry[attempt]
+        const passing = passingSetup(error)
+        // Only a problem a passing network causes is worth waiting out; a CLI the operator must configure is not.
+        if (wait === undefined || !passing) {
+          // Retries are spent: schedule one more setup run so an outage longer than the retries still heals itself.
+          if (passing) this.rearm()
+          return false
+        }
+        this.host.context.logger.info('dsh-superagent: setup hit %s; trying again in %dms', error.code, wait)
+        await this.hold(wait)
+        if (this.host.lifetime.aborted) return false
+      }
     }
+  }
+  /** Waits between setup attempts, ending as soon as the runtime stops. */
+  private hold(ms: number): Promise<void> {
+    const { lifetime } = this.host
+    if (ms <= 0 || lifetime.aborted) return Promise.resolve()
+    return new Promise<void>(resolve => {
+      let timer: ReturnType<typeof setTimeout>
+      const done = (): void => { clearTimeout(timer); lifetime.removeEventListener('abort', done); resolve() }
+      timer = setTimeout(done, ms)
+      lifetime.addEventListener('abort', done, { once: true })
+    })
+  }
+  /** The rearm a failing setup scheduled, or undefined when setup is healthy or no rearm is pending. */
+  get rearmDue(): { dueAt: string } | undefined {
+    return this.rearmAt === undefined ? undefined : { dueAt: new Date(this.rearmAt).toISOString() }
+  }
+
+  /** Schedules one setup run after `rearmMs`, so a passing network that outlasts the retries needs no operator restart. */
+  private rearm(): void {
+    const wait = this.rearmMs
+    if (this.rearmed || wait <= 0) return
+    const { lifetime } = this.host
+    if (lifetime.aborted) return
+    this.rearmed = true
+    this.rearmAt = Date.now() + wait
+    this.host.context.logger.info('dsh-superagent: setup is still failing; running it again in %dms', wait)
+    const fire = (): void => { this.rearmed = false; this.rearmAt = undefined; this.restart() }
+    const timer = setTimeout(fire, wait)
+    // A pending rearm must not keep the process alive on its own.
+    ;(timer as { unref?: () => void }).unref?.()
+    lifetime.addEventListener('abort', () => clearTimeout(timer), { once: true })
   }
   /** Trigger a restart to re-run setup, refusing if setup and Feishu are already healthy so running assignments are not interrupted. */
   check(): void {

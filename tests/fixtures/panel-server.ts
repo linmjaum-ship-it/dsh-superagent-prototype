@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { UsageTotals } from '../../src/app/usage.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
 import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
@@ -85,6 +86,10 @@ export const MACHINE = { stateDir: '/srv/dsh-superagent', promptMaxChars: 100000
 
 type Settings = ReturnType<typeof SettingsSchema.parse>
 export interface PanelServer {
+  /** The usage totals the cost panel reads; the zeros when a test does not set them. */
+  usage?: ApiResponse<'GET usage'>
+  routines?: ApiResponse<'GET routines'>['routines']
+  approvals?: ApiResponse<'GET approvals'>['approvals']
   joined?: Record<string, string>; joining?: Record<string, string>
   joinError?: string
   settings: Settings; revisions: Record<string, number>
@@ -106,6 +111,8 @@ export interface PanelServer {
   pending: number
   form?: ConfigForm<Record<string, unknown>> | undefined
   opened: string[]
+  /** Count of `POST selftest/wake` requests the panel made. */
+  wakes?: number
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
 }
@@ -159,7 +166,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
-  masterId: 'master', paused: server.settings.paused,
+  masterId: 'master', paused: server.settings.paused, passMs: 2000,
   // The panel does not read health; the service script does.
   health: {},
 })
@@ -223,7 +230,7 @@ const ticketDetail = (): TicketPageView => ({
 })
 function threadPage(key: string, { before, around }: { before?: string; around?: string }): ThreadPageView | undefined {
   if (key !== threadSummary().key) return undefined
-  const base = { ...threadSummary(), tickets: [ticketSummary()], correlated: [{ key: 'github:42', title: 'PR 42' }], decisions: [],
+  const base = { ...threadSummary(), tickets: [ticketSummary()], correlated: [{ key: 'github:42', title: 'PR 42' }], decisions: [], approvals: [],
     url: 'https://example.test/thread', context: [] }
   const decision = { id: 'd1', outcome: 'accept' as const, reason: [{ code: 'said', values: { text: 'x' } }], ticketId: 't1' }
   if (before === 'cursor-1' || around === 'e1') return { ...base, timeline: [trigger('e1', '2026-09-20T00:00:00Z',
@@ -248,7 +255,7 @@ function initial(): PanelServer {
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
     health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
-    setup: { machine: MACHINE, problem: null, feishuProblem: null,
+    setup: { machine: MACHINE, problem: null, feishuProblem: null, rearm: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
     settings, revisions: { policy: 3, eval: 1, executor: 0 },
@@ -290,6 +297,9 @@ const ticketOf = (id: string) =>
   [...server.tickets.open, ...server.person, ...server.tickets.ended].find(ticket => ticket.id === id) ?? server.ticketDetails[id]
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
+/** A usage total for a window nothing ran in, in the shape the ledger reports. */
+const zeroUsage = (): UsageTotals => ({ calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, cacheHitRate: 0, estimatedYuan: 0 })
+
 const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
@@ -298,6 +308,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     await server.searching?.(q)
     return { tickets: [], threads: server.search.threads, items: server.search.items.filter(item => item.preview.includes(q)) }
   } },
+  'GET usage': { answer: () => server.usage ?? { today: zeroUsage(), last24Hours: zeroUsage(), bySession: [] } },
   'GET sources': { answer: sourceStatuses },
   'GET settings': { answer: settingsView },
   'POST sources/:id/labels': { answer: () => {
@@ -338,11 +349,20 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     server.tickets.open = []; server.person = server.person.filter(ticket => ticket.id !== params.id)
     return { stopped: true }
   } },
+  'POST tickets/:id/compact': { answer: ({ params }) => {
+    if (!ticketOf(params.id)) return refuse(404, 'Ticket not found')
+    return { compacted: true }
+  } },
+  'POST tickets/:id/prompt': { body: true, answer: ({ params }) => {
+    if (!ticketOf(params.id)) return refuse(404, 'Ticket not found')
+    return { prompted: true }
+  } },
   'POST executor/pause': { body: true, answer: ({ body }) => {
     server.settings = { ...server.settings, paused: body.paused }
     server.revisions.pause = (server.revisions.pause ?? 0) + 1
     return { paused: body.paused }
   } },
+  'POST selftest/wake': { answer: () => { server.wakes = (server.wakes ?? 0) + 1; return { woken: true } } },
   'PUT settings/:block': { body: true, answer: ({ params: { block }, body }) => {
     const source = block.startsWith('source:') ? KINDS.find(kind => `source:${kind.kind}` === block) : undefined
     if (!['policy', 'eval', 'executor'].includes(block) && !source) return block.startsWith('source:') ? refuse(404, 'Source not found')
@@ -369,6 +389,32 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET policy/history': { answer: () => server.history },
   'POST policy-sync/:id': { answer: ({ params }) => ({ policy: server.settings.policy.sources[params.id] }) },
   'POST setup/check': { answer: () => ({ restarting: true }) },
+  'GET routines': { answer: () => ({ routines: server.routines ?? [] }) },
+  'GET approvals': { answer: () => {
+    const list = server.approvals ?? []
+    const tally = (state: ApiResponse<'GET approvals'>['approvals'][number]['state']) => list.filter(item => item.state === state).length
+    return { approvals: list, tally: { waiting: tally('pending'), approved: tally('approved'), rejected: tally('rejected'),
+      expired: tally('expired'), used: tally('used') } }
+  } },
+  'POST approvals/:id/decide': { body: true, answer: ({ params: { id }, body }) => {
+    const approval = server.approvals?.find(item => item.id === id)
+    if (approval === undefined) return refuse(404, 'No approval is waiting under that id')
+    const decided = { ...approval, state: body.answer === 'approve' ? 'approved' as const : 'rejected' as const,
+      decidedBy: 'panel', decidedVia: 'panel' as const }
+    server.approvals = server.approvals?.map(item => item.id === id ? decided : item)
+    return { approval: decided }
+  } },
+  'POST routines': { body: true, answer: ({ body }) => {
+    const routine = { id: 'routine-1', name: body.name, cron: body.cron, prompt: body.prompt, enabled: body.enabled ?? true,
+      createdAt: '2026-01-01T00:00:00.000Z', nextAt: '2026-01-02T09:00:00.000Z' }
+    server.routines = [...(server.routines ?? []), routine]
+    return { routine }
+  } },
+  'POST routines/:id/remove': { answer: ({ params: { id } }) => {
+    const before = (server.routines ?? []).length
+    server.routines = (server.routines ?? []).filter(routine => routine.id !== id)
+    return { removed: before !== (server.routines).length }
+  } },
   'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
