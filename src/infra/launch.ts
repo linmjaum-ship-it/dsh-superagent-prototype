@@ -39,3 +39,37 @@ export function shellLine(command: string, platform: string = process.platform):
   const lines = command.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '')
   return { command: shellFor(), args: ['/d', '/s', '/c', lines.join(' && ')] }
 }
+
+/**
+ * A Sandboxie box to start commands in: the launcher and the box it names. A box confines what the command writes, which
+ * is what an operator wants of the commands a worker's work runs, and it costs one more process in the chain.
+ */
+export interface Sandbox {
+  readonly launcher: string
+  readonly box: string
+}
+
+/** Where Sandboxie-Plus installs its launcher; an install elsewhere is named by DSH_SUPERAGENT_SANDBOX_EXE. */
+const SANDBOX_LAUNCHER = 'C:\\Program Files\\Sandboxie-Plus\\Start.exe'
+
+/**
+ * The box to start commands in, when the operator asked for one: `DSH_SUPERAGENT_SANDBOX=1` turns it on and
+ * `DSH_SUPERAGENT_SANDBOX_BOX` names the box. Nothing is boxed unless a person configured it, so a machine without
+ * Sandboxie works exactly as it did before.
+ */
+export function sandboxFrom(environment: Record<string, string | undefined> = process.env, platform: string = process.platform): Sandbox | undefined {
+  if (platform !== 'win32' || environment.DSH_SUPERAGENT_SANDBOX !== '1') return undefined
+  return {
+    launcher: environment.DSH_SUPERAGENT_SANDBOX_EXE ?? SANDBOX_LAUNCHER,
+    box: environment.DSH_SUPERAGENT_SANDBOX_BOX ?? 'superagent_worker',
+  }
+}
+
+/**
+ * The same command, started inside the box: Sandboxie's launcher takes the box name and then the program with its
+ * arguments, and `/silent` keeps a box that cannot start from stopping for a dialog nobody is there to answer.
+ */
+export function boxed(run: Launched, sandbox: Sandbox | undefined): Launched {
+  if (sandbox === undefined) return run
+  return { command: sandbox.launcher, args: [`/box:${sandbox.box}`, '/silent', run.command, ...run.args] }
+}

@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
 import { blockedCommand } from '../app/command-gate.ts'
+import { boxed, sandboxFrom } from './launch.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
@@ -77,8 +78,10 @@ export class Commands {
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     const name = blockedCommand(program, this.blocked())
     if (name !== undefined) throw new CliError(`${name} is blocked in this installation`, 1)
+    // A box confines what the command writes; sandboxFrom is undefined until an operator wires one up.
+    const run = boxed({ command: program, args }, sandboxFrom({ ...process.env, ...this.environment }))
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+      const { stdout } = await exec(run.command, [...run.args], { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
         env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
       return stdout
     } catch (error) { throw commandError(error, program) }

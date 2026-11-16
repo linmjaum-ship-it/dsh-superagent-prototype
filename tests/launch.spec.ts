@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { launchCommand, shellLine } from '../src/infra/launch.ts'
+import { boxed, launchCommand, sandboxFrom, shellLine } from '../src/infra/launch.ts'
 
 const windows = process.platform === 'win32'
 const shell = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\cmd.exe`
@@ -73,5 +73,31 @@ describe('the shell a prepare script is run with', () => {
     expect(shellLine('git fetch origin main\n\n  git worktree add w main  \n', 'win32')).toEqual({
       command: shell, args: ['/d', '/s', '/c', 'git fetch origin main && git worktree add w main'],
     })
+  })
+})
+
+describe('the box a command can be started in', () => {
+  it('leaves a command alone until an operator asks for a box', () => {
+    expect(sandboxFrom({}, 'win32')).toBeUndefined()
+    expect(sandboxFrom({ DSH_SUPERAGENT_SANDBOX: '0' }, 'win32')).toBeUndefined()
+    // Sandboxie exists only on Windows, so another platform never boxes anything.
+    expect(sandboxFrom({ DSH_SUPERAGENT_SANDBOX: '1' }, 'linux')).toBeUndefined()
+  })
+
+  it('names the box Sandboxie-Plus ships with, or the one the operator configured', () => {
+    expect(sandboxFrom({ DSH_SUPERAGENT_SANDBOX: '1' }, 'win32')).toEqual({
+      launcher: 'C:\\Program Files\\Sandboxie-Plus\\Start.exe', box: 'superagent_worker',
+    })
+    expect(sandboxFrom({ DSH_SUPERAGENT_SANDBOX: '1', DSH_SUPERAGENT_SANDBOX_BOX: 'probe', DSH_SUPERAGENT_SANDBOX_EXE: 'C:\\sb\\Start.exe' }, 'win32'))
+      .toEqual({ launcher: 'C:\\sb\\Start.exe', box: 'probe' })
+  })
+
+  it('puts the box name and the command after the launcher, in that order', () => {
+    const run = boxed({ command: 'C:\\tools\\gh.exe', args: ['api', 'user'] }, { launcher: 'C:\\sb\\Start.exe', box: 'probe' })
+    expect(run).toEqual({
+      command: 'C:\\sb\\Start.exe',
+      args: ['/box:probe', '/silent', 'C:\\tools\\gh.exe', 'api', 'user'],
+    })
+    expect(boxed({ command: 'gh.exe', args: [] }, undefined)).toEqual({ command: 'gh.exe', args: [] })
   })
 })
