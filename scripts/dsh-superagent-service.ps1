@@ -32,6 +32,11 @@
   The profile's state directory, for -Method supervise. A process killed with no chance to clean up leaves the lock
   beside it, and a start that keeps waiting for that lock answers 404 on every orchestrator route instead of mounting.
   The loop removes the lock it finds while nothing is serving, so the restarted profile can take it.
+
+.PARAMETER Box
+  A Sandboxie box name, for -Method supervise. The whole instance, the workers it starts included, then runs
+  inside that box; the box must already allow the paths the profile writes through OpenFilePath. Empty starts
+  the profile on the host, as before.
 #>
 [CmdletBinding()]
 param(
@@ -44,7 +49,8 @@ param(
   [string]$Dsh = '',
   [string]$WinSW = 'winsw.exe',
   [int]$Port = 3082,
-  [string]$StateDir = ''
+  [string]$StateDir = '',
+  [string]$Box = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,6 +74,26 @@ $startCommand = if ($dshPath -match '\.ps1$') {
 }
 $execute = if ($dshPath -match '\.ps1$') { 'powershell.exe' } else { $dshPath }
 $executeArguments = if ($dshPath -match '\.ps1$') { '-NoProfile -ExecutionPolicy Bypass -File "' + $dshPath + '" ' + $arguments } else { $arguments }
+# A box wraps the whole instance, workers included. Sandboxie starts a command line rather than a program, so the
+# profile runs through a launcher this script writes and the box is named once.
+$startExe = 'C:\Program Files\Sandboxie-Plus\Start.exe'
+$boxLauncher = Join-Path (Join-Path $env:LOCALAPPDATA 'dsh-superagent') 'box-launch.cmd'
+if ($Box) {
+  $execute = $startExe
+  $executeArguments = '/box:' + $Box + ' /silent cmd.exe /d /s /c "' + $boxLauncher + '"'
+}
+
+function Write-BoxLauncher {
+  $dir = Split-Path -Parent $boxLauncher
+  $null = New-Item -ItemType Directory -Force -Path $dir
+  $body = @(
+    '@echo off',
+    'setlocal',
+    'set "ELECTRON_RUN_AS_NODE=1"',
+    ('"' + $dshPath + '" ' + $arguments + ' > "' + (Join-Path $dir 'box-run.log') + '" 2>&1')
+  )
+  Set-Content -Path $boxLauncher -Value $body -Encoding Ascii
+}
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $keepalive = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + $PSCommandPath + ' -Action keepalive -Method startup'
 # The resident loop starts the same way, at logon, and restarts the profile itself on every tick.
@@ -75,6 +101,8 @@ $supervise = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + $PSCom
 if ($StateDir) { $supervise = $supervise + ' -StateDir "' + $StateDir + '"' }
 $superviseStart = "Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','" + $PSCommandPath + "','-Action','supervise'"
 if ($StateDir) { $superviseStart = $superviseStart + ",'-StateDir','" + $StateDir + "'" }
+if ($Box) { $superviseStart = $superviseStart + ",'-Box','" + $Box + "'" }
+if ($Box) { $supervise = $supervise + ' -Box "' + $Box + '"' }
 $superviseStart = $superviseStart + ' -WindowStyle Hidden'
 # Stopping the loop is its own command because stopping the profile is what "startup" stop means.
 $stopLoop = 'Get-CimInstance Win32_Process -Filter "Name=''powershell.exe''" | Where-Object { $_.CommandLine -like ''*-Action supervise*'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }'
@@ -196,6 +224,7 @@ if ($Action -eq 'supervise') {
   Add-Content -Path $log -Value ((Get-Date).ToString('o') + " supervise started every 10s on port $Port")
   $degraded = 0
   while ($true) {
+    if ($Box) { Write-BoxLauncher }
     $health = 'down'
     try {
       $answer = Invoke-WebRequest ("http://127.0.0.1:" + $Port + "/orchestrator/api/state") -Headers @{ 'x-orchestrator-request' = '1' } -UseBasicParsing -TimeoutSec 5
@@ -225,7 +254,10 @@ if ($Action -eq 'supervise') {
       # just made or the one the Run key made at logon: removing it makes that start fail to mount while a second
       # instance fights for the port, which is how two boots ended up sharing one state directory. Only a lock older
       # than the grace, left by a process that died, counts as stale.
-      $age = -1.0
+      # Inside a box the profile's command line is the launcher's, so the process that holds the lock is matched
+    # by the launcher path instead of the profile argument.
+    $profileTag = if ($Box) { Split-Path -Leaf $boxLauncher } else { '--profile ' + $Profile }
+    $age = -1.0
       if ($lock -and (Test-Path -LiteralPath $lock)) {
         $age = ((Get-Date) - (Get-Item -LiteralPath $lock).LastWriteTime).TotalSeconds
       }
@@ -234,7 +266,7 @@ if ($Action -eq 'supervise') {
       # boot that hung, and that one is worth replacing.
       $alive = @(Get-CimInstance Win32_Process | Where-Object {
         $_.ProcessId -ne $PID -and $_.CommandLine -and
-        $_.CommandLine -like ('*--profile ' + $Profile + '*') -and
+        $_.CommandLine -like ('*' + $profileTag + '*') -and
         $_.CommandLine -notlike '*-Action supervise*'
       }).Count -gt 0
       if ($lock -and (Test-Path -LiteralPath $lock) -and $alive -and $age -lt 90) {

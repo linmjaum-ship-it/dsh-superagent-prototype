@@ -78,6 +78,13 @@ describe.skipIf(process.platform !== 'win32')('dsh-superagent-service.ps1', () =
     expect(output.split('\n').filter(line => line.startsWith('+ '))).toEqual([])
   })
 
+  it('names the box in the value it registers, so the whole instance comes back inside that box', () => {
+    const { output, code } = run('-Action', 'plan', '-Method', 'supervise', '-Box', 'superagent_worker')
+    expect(code).toBe(0)
+    expect(output).toContain('-Action supervise -Method startup -Box "superagent_worker"')
+    expect(output.split('\n').filter(line => line.startsWith('+ '))).toEqual([])
+  })
+
   it('reports whether the task is registered and whether the profile answers, in one line', () => {
     const { output } = run('-Action', 'status')
     expect(output.trim()).toMatch(/^target=DshSuperAgent registered=(True|False) running=(True|False) .*port=3082 listening=(True|False) state=(http 200|unreachable)$/)
