@@ -11,6 +11,15 @@ import { boxed, sandboxFrom } from './launch.ts'
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
 /**
+ * Reads one lark-cli reply. The CLI prints a single JSON document, but a run that is cut short leaves a truncated
+ * one, and a parse failure is not a Feishu error: the caller asks again instead of reporting a SyntaxError.
+ */
+function parseLark<T>(output: string): { ok: boolean; data: T; error?: { code?: number; message?: string } } | undefined {
+  try { return JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } } }
+  catch { return undefined }
+}
+const LARK_ATTEMPTS = 2
+/**
  * Error thrown by Commands when a CLI invocation fails, capturing stderr diagnostics, API error codes, and exit status without echoing command arguments.
  * Source channels and pollers inspect its code to distinguish deleted conversations from retryable failures.
  */
@@ -117,9 +126,14 @@ export class Commands {
   async lark<T>(args: string[], cwd?: string): Promise<T> {
     const bot = this.deployment.feishu
     if (!bot) throw new Error('The Feishu Source has no working bot CLI')
-    const output = await this.run(bot.cli, [...args, '--as', 'bot', '--format', 'json'], cwd)
-      .catch((error: unknown) => { throw membership(error) })
-    const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } }
+    let output = ''
+    let result: ReturnType<typeof parseLark<T>> = undefined
+    for (let attempt = 0; attempt < LARK_ATTEMPTS && result === undefined; attempt += 1) {
+      output = await this.run(bot.cli, [...args, '--as', 'bot', '--format', 'json'], cwd)
+        .catch((error: unknown) => { throw membership(error) })
+      result = parseLark<T>(output)
+    }
+    if (result === undefined) throw new CliError(`Feishu returned a truncated reply: ${output.trim().slice(0, 200)}`, undefined, 1)
     const code = result.error?.code
     if (!result.ok) throw membership(new CliError(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`, code))
     return result.data
