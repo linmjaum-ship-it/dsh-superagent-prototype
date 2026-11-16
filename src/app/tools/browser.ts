@@ -12,8 +12,20 @@ export const BrowserActionSchema = z.object({
 
 export type BrowserAction = z.infer<typeof BrowserActionSchema>
 
+/**
+ * Refuses a page the browser could not load. Chrome reports a navigation that never reached a server as its own
+ * error page, whose url starts with `chrome-error://`; reading that tree would tell the worker a page exists that
+ * never loaded, so it counts as a failure and feeds the streak the tool watches.
+ */
+function loaded(snapshot: AriaSnapshot): AriaSnapshot {
+  if (!snapshot.url.startsWith('chrome-error://')) return snapshot
+  const said = snapshot.text.split('\n').map(line => line.replace(/^\s*-\s*/, '').trim()).filter(line => line !== '').slice(0, 4).join('; ')
+  throw new Error(`the browser could not load the page: ${said}`)
+}
+
 /** What a worker sees of a page: the accessibility tree, its refs, and what a screenshot of the same page would cost. */
 function page(snapshot: AriaSnapshot): Record<string, unknown> {
+  loaded(snapshot)
   return {
     url: snapshot.url,
     title: snapshot.title,
@@ -69,7 +81,9 @@ export function browserTool(sessions: BrowserSessions, ticketId: string): Tool {
         const count = sessions.beaten(ticketId)
         const reason = error instanceof Error ? error.message : String(error)
         if (count < BEATEN_TIMES) throw new Error(reason)
-        throw new Error(`${reason} This ticket's page has beaten us ${count} times: stop taking steps and report back with orchestrator_trigger_handback, saying what you tried and what the page did.`)
+        // A routine's Trigger became this ticket rather than reaching it as an Input, so hand-back refuses it: the
+        // report is the step that reaches a person for every kind of ticket.
+        throw new Error(`${reason} This ticket's page has beaten us ${count} times: stop taking steps and report back with orchestrator_report in state blocked, saying what you tried and what the page did, and ask for a person with human_action; a message that asks for work beyond this ticket is handed back with orchestrator_trigger_handback instead.`)
       }
     },
   })

@@ -78,6 +78,38 @@ describe('orchestrator_browser', () => {
 
 })
 
+const errorPage = (): AriaSnapshot => ({
+  url: 'chrome-error://chromewebdata/', title: '127.0.0.1',
+  text: '- RootWebArea "127.0.0.1"\n  - StaticText "ERR_UNSAFE_PORT"',
+  refs: new Map(), cost: { aria: 10, screenshot: 1_000 },
+})
+
+class ErrorBrowser extends FakeBrowser {
+  override async open(): Promise<AriaSnapshot> { return errorPage() }
+  override async snapshot(): Promise<AriaSnapshot> { return errorPage() }
+}
+
+describe('a page that never loaded', () => {
+  it('counts Chrome\'s own error page as a failure, so the streak reaches the handback', async () => {
+    const pool = new BrowserSessions(async () => new ErrorBrowser())
+    const tool = browserTool(pool, 'ticket-a')
+    const fail = async (): Promise<string> => {
+      try {
+        await run(tool, { action: 'open', url: 'http://127.0.0.1:1/nothing' })
+        throw new Error('the page was expected to refuse')
+      } catch (error) {
+        return (error as Error).message
+      }
+    }
+    expect(await fail()).toContain('the browser could not load the page')
+    expect(await fail()).toContain('ERR_UNSAFE_PORT')
+    const third = await fail()
+    expect(third).toContain('beaten us 3 times')
+    expect(third).toContain('orchestrator_report in state blocked')
+    expect(third).toContain('human_action')
+  })
+})
+
 describe('a page that keeps refusing', () => {
   it('counts failures per ticket, so a stranger page is not blamed for this one', async () => {
     const { sessions: pool } = sessions()
@@ -106,7 +138,7 @@ describe('a page that keeps refusing', () => {
     expect(message).not.toContain('orchestrator_trigger_handback')
   })
 
-  it('tells the worker to hand back after the third failure instead of clicking on', async () => {
+  it('tells the worker to ask for a person after the third failure instead of clicking on', async () => {
     const { sessions: pool } = sessions()
     const tool = browserTool(pool, 'ticket-a')
     const fail = async (): Promise<string> => {
@@ -122,6 +154,7 @@ describe('a page that keeps refusing', () => {
     const third = await fail()
     expect(third).toContain('No page is open for this ticket; open one first')
     expect(third).toContain('beaten us 3 times')
-    expect(third).toContain('orchestrator_trigger_handback')
+    expect(third).toContain('orchestrator_report in state blocked')
+    expect(third).toContain('human_action')
   })
 })
