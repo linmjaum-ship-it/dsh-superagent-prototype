@@ -4,11 +4,14 @@ import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/inde
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
+import type { BrowserSessions } from '../browser-sessions.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
-import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { browserTool } from './browser.ts'
+import { readTool } from './read.ts'
+import { AcknowledgementSchema, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
@@ -17,6 +20,8 @@ export interface ExecutorToolsHost {
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
+  /** Browsers a ticket may drive; absent unless the profile opted in, since a browser can click anything. */
+  readonly browser?: BrowserSessions
   sendReplies(): Promise<void>
 }
 
@@ -101,5 +106,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         })
       },
     }),
+    // A browser is the one tool that can act on a page nobody wrote a rule for, so it arrives only when the profile opts in.
+    ...(host.browser === undefined ? [] : [browserTool(host.browser, ticketId)]),
   ]
 }

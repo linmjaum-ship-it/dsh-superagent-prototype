@@ -8,6 +8,7 @@ import { checkedImText } from '../infra/text.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
 import { admissionContext } from '../sources/admission-context.ts'
+import { scanThread, scanView } from './untrusted.ts'
 import { readRepositoryPath } from '../sources/github-read.ts'
 import type { TriggerContext } from '../sources/kind.ts'
 import { relatedTickets } from './cards.ts'
@@ -58,6 +59,8 @@ export interface AssessorHost {
   paused(): boolean
   /** Thread context reader for `trigger`'s Source, or `undefined` when the Source has none. */
   threadContext(trigger: Trigger): TriggerContext | undefined
+  /** Records the untrusted-input score so a flagged thread is visible in the service log, not only in the payload. */
+  log?(line: string): void
   /** Delivers a candidate card to the main Session once per request ID, resolving after the Session receives it. */
   deliver(requestId: string, text: string): Promise<void>
   candidateCard(candidate: Candidate): Promise<Record<string, unknown>>
@@ -216,8 +219,23 @@ export class MasterAssessor implements Assessor {
       }) } : {},
       // The rules are in the main Session's Policy section, which names the version the candidate's Eval was built from.
       ...relatedTickets(candidate.tickets), policy_version: candidate.policyVersion,
+      ...this.untrusted(trigger, context, source?.messageId),
       thread }
   }
+  /**
+   * Screens the trigger and the loaded window for injection structure. External text is data, never authority: the
+   * score travels with the payload so the decision can weigh it, and the log keeps it after the evaluation ends.
+   */
+  private untrusted(trigger: Trigger, context: AssessmentContext | undefined, sourceId: string | undefined) {
+    const texts = [trigger.text, ...(context?.messages ?? []).filter(message => !message.deleted && message.id !== sourceId)
+      .map(message => message.text)]
+    const result = scanThread(texts)
+    if (result.signals.length > 0) {
+      this.host.log?.(`untrusted scan ${result.flagged ? 'FLAGGED' : 'noted'} score ${result.score}: ${result.signals.map(signal => signal.rule).join(', ')}`)
+    }
+    return result.signals.length === 0 ? {} : { untrusted: scanView(result) }
+  }
+
   /**
    * Serves bounded paginated text or image attachments from the evaluation's thread context or repository for
    * `orchestrator_eval_read`; `agent` is the main Session, which receives images as attachments.

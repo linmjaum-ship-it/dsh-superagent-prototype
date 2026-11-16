@@ -11,7 +11,7 @@ import { InfoTip, Input } from './controls.tsx'
 import { SaveBar, useDraft } from './draft.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { Field, Fields } from './settings-kit.tsx'
-import { setupText, type T } from './text.ts'
+import { setupText, when, type T } from './text.ts'
 import { CheckSetupButton, Hint, KeyValues, Section, SetupMessage } from './widgets.tsx'
 
 export type DeploymentForm = ConfigPageForm | undefined
@@ -61,6 +61,7 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
       {setup.problem && <div className="dt-row-buttons">
         <p className="dt-error" role="status"><SetupMessage problem={setup.problem} lead /></p><CheckSetupButton />
       </div>}
+      {setup.problem && setup.rearm && <Hint>{t('problemSetupHeal', { when: when(setup.rearm.dueAt, t('lang')) })}</Hint>}
       {showAccounts && <Section title={t('deploymentDerived')} hint={t('deploymentDerivedHint')}>
         <KeyValues rows={[[t('deploymentRepository'), accounts?.repository ?? '—'],
           [t('deploymentAgent'), accounts ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />

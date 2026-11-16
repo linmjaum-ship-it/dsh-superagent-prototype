@@ -12,7 +12,8 @@ import { readResource, type MainResourceHost, type ResourceHost } from '../resou
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import type { Store } from '../store.ts'
-import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { readTool } from './read.ts'
+import { AcknowledgementSchema, tool, type Tool } from './tool.ts'
 
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)

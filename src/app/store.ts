@@ -8,6 +8,8 @@ import { KV, type Family, type Key } from '../kv.ts'
 import { SettingsSchema, type Settings, type SettingsOrigin, type SettingsSave } from '../policy.ts'
 import { OLDEST_SCHEMA, SCHEMA_VERSION, migrateTo11, tooOld } from './migration.ts'
 import { Versions } from './versions.ts'
+import type { ApprovalRequest } from './approvals.ts'
+import type { Routine } from './routines.ts'
 import { storeReads } from './store-read.ts'
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
@@ -77,6 +79,8 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trigger_thread (thread TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, human INTEGER NOT NULL,
               PRIMARY KEY (thread, id));
+            CREATE TABLE IF NOT EXISTS routine (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS approval (id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS effect (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, seq INTEGER NOT NULL,
               generation INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL,
               since TEXT NOT NULL, PRIMARY KEY (kind, key));
@@ -239,6 +243,20 @@ export class Store implements Repositories {
     open: (): Ticket[] => this.values('SELECT value FROM ticket WHERE open = 1 ORDER BY rowid DESC'),
     /** Newest first. */
     active: (): Ticket[] => this.values('SELECT value FROM ticket WHERE active = 1 ORDER BY rowid DESC'),
+  }
+  /** Cron-scheduled routines the agent runs on its own; a routine never grants authority (see `Routines.advance`). */
+  readonly routines = {
+    get: (id: string): Routine | undefined => { const row = this.db.prepare('SELECT value FROM routine WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Routine : undefined },
+    save: (routine: Routine): void => { this.db.prepare('INSERT INTO routine VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(routine.id, JSON.stringify(routine)) },
+    remove: (id: string): boolean => this.db.prepare('DELETE FROM routine WHERE id=?').run(id).changes > 0,
+    list: (): Routine[] => this.values('SELECT value FROM routine ORDER BY rowid'),
+  }
+  /** Questions a person answers on a card before an irreversible command runs; see `Approvals`. */
+  readonly approvals = {
+    get: (id: string): ApprovalRequest | undefined => { const row = this.db.prepare('SELECT value FROM approval WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as ApprovalRequest : undefined },
+    save: (request: ApprovalRequest): void => { this.db.prepare('INSERT INTO approval VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(request.id, JSON.stringify(request)) },
+    /** Oldest first, so a person reads the cards in the order they were asked. */
+    list: (): ApprovalRequest[] => this.values('SELECT value FROM approval ORDER BY rowid'),
   }
   readonly decisions = {
     get: (id: string): Decision | undefined => { const row = this.db.prepare('SELECT value FROM decision WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Decision : undefined },

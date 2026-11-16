@@ -1,6 +1,7 @@
 /** Thread list, timeline detail, cross-entity search, and decision list views. */
 import { threadKey, type Thread, type Ticket, type Trigger } from '../../core/index.ts'
-import type { ThreadFilter } from '../api.ts'
+import type { ApprovalRequest } from '../approvals.ts'
+import type { ApprovalView, ThreadFilter } from '../api.ts'
 import type { TextCache } from '../cache.ts'
 import { awaitingEval, channelLink, dayAgo, decisionView, newestFirst, page, snapshot, threadSummary, threadTitle, ticketLine,
   ticketSummary, triggerView, type ViewHost } from './records.ts'
@@ -26,6 +27,18 @@ export type ThreadListView = ReturnType<typeof threadList>
  * Thread timeline with triggers ordered oldest-first, inline decisions, and subscribed tickets.
  * `before` pages backward; `around` anchors the page on a specific trigger.
  */
+/**
+ * The approvals asked for this Thread's Tickets, oldest first: who decided what, and when, so a worker stuck behind
+ * a gate can be explained from the Thread that produced it.
+ */
+function approvalLine(request: ApprovalRequest): ApprovalView {
+  return { id: request.id, ticketId: request.ticketId, rule: request.rule, command: request.command, state: request.state,
+    askedAt: request.askedAt, expiresAt: request.expiresAt, ...(request.decidedAt ? { decidedAt: request.decidedAt } : {}),
+    ...(request.decidedBy ? { decidedBy: request.decidedBy } : {}),
+    ...(request.decidedVia ? { decidedVia: request.decidedVia } : {}) }
+}
+/** How many approvals a Thread's page lists; the panel folds them like Decisions, so this stays small. */
+const APPROVAL_LIMIT = 20
 export function threadDetail(host: ViewHost, key: string, before: string | undefined, limit: number, around?: string) {
   const { store } = host
   const thread = store.threads.get(key)
@@ -49,6 +62,8 @@ export function threadDetail(host: ViewHost, key: string, before: string | undef
     }),
     tickets: thread.subscriptions.flatMap(id => { const ticket = store.tickets.get(id); return ticket ? [ticketLine(view, ticket)] : [] }),
     decisions: decisions.slice().reverse().map(decision => decisionView(view, decision)),
+    approvals: store.approvals.list().filter(request => thread.subscriptions.includes(request.ticketId))
+      .slice(-APPROVAL_LIMIT).map(approvalLine),
     timeline: shown.map(trigger => triggerView(view, trigger, decisions)), earlier: more ? `${shown[0]!.at}|${shown[0]!.id}` : null }
 }
 export type ThreadDetailView = NonNullable<ReturnType<typeof threadDetail>>

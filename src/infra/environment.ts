@@ -10,10 +10,14 @@ import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
+import { launchCommand } from './launch.ts'
+import { commandName, shimNames } from '../app/command-gate.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
+/** Windows shells run batch files: a `#!/bin/sh` shim there is a file no shell can execute, so the shims are written as `.cmd` instead. */
+const windows = process.platform === 'win32'
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
 export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
@@ -60,7 +64,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 /** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
-  const head = (await readFile(file, 'utf8')).split('\n', 2)
+  // A batch shim marks itself in a comment, so the marker line carries a command prefix there.
+  const head = (await readFile(file, 'utf8')).split('\n', 2).map(line => line.replace(/^(?:::|@rem|rem)\s+/, ''))
   return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
@@ -86,7 +91,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const kept = new Set<string>()
   const shim = async (name: string, body: string): Promise<void> => {
     const temporary = join(dir, `.${name}.${process.pid}.tmp`)
-    await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
+    await writeFile(temporary, windows ? `@echo off\n:: ${MARKER}\n${body}\n` : `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
     await rename(temporary, join(dir, name))
     kept.add(name)
   }
@@ -95,12 +100,33 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+  // A batch shim drops its own directory from PATH the same way, so a wrapper resolving `gh` by name reaches the real binary instead of this file.
+  // Batch cannot nest expansions inside a substitution, so the entries are copied one by one with the shim directory left out.
+  const batch = [
+    'setlocal enabledelayedexpansion',
+    'set "SELF=%~dp0"',
+    'if "!SELF:~-1!"=="\\" set "SELF=!SELF:~0,-1!"',
+    'set "NEWPATH="',
+    'for %%e in ("!PATH:;=";"!") do (',
+    '  set "ENTRY=%%~e"',
+    '  if /i not "!ENTRY!"=="!SELF!" set "NEWPATH=!NEWPATH!;!ENTRY!"',
+    ')',
+    'if defined NEWPATH set "PATH=!NEWPATH:~1!"',
+  ].join('\n')
+  const run = (program: string): string => windows
+    ? `${batch}\n"${program}" %*\nexit /b %ERRORLEVEL%`
+    : `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  const fail = (message: string): string => windows
+    ? `>&2 echo ${message}\nexit /b 1`
+    : `echo ${shellQuote(message)} >&2\nexit 1`
+  await shim(windows ? 'gh.cmd' : 'gh', run(github.cli))
+  await shim(windows ? 'lark-cli.cmd' : 'lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  // Shims cover the name a shell resolves and the suffixes a Windows shell tries first, so `rm.exe` fails like `rm`.
+  const blocked = blockedCommands.filter(entry => !WORKER_COMMANDS.includes(commandName(entry)))
+  // Windows resolves `.cmd` through PATHEXT; the suffix-less names and `.bat`/`.exe` spellings are POSIX-only.
+  const blockedShims = windows ? blocked.map(name => `${name}.cmd`) : blocked.flatMap(name => shimNames([name]))
+  for (const name of blockedShims) {
+    await shim(name, fail(`${windows ? name.slice(0, -4) : name} is blocked in this installation; use gh, which acts as ${github.login}.`))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [
@@ -126,7 +152,10 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */
 export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
-  const handle = subprocess.spawn({ argv, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
+  // A CLI installed through npm is a batch file on Windows, which Node cannot start directly: `launchCommand` names the shell that can.
+  const [program = '', ...rest] = argv
+  const launched = launchCommand(program, rest)
+  const handle = subprocess.spawn({ argv: [launched.command, ...launched.args], cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
   const { exitCode } = await handle.done
   const read = (reader: SubprocessOutputReader | undefined): string => reader?.readFrom(0).text ?? ''
   if (exitCode === 0) return read(handle.collected.stdout)

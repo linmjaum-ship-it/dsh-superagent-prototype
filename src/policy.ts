@@ -189,6 +189,14 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
   return {
     version, paused: settings.paused, evalTimeoutMs: settings.eval.timeoutSeconds * 1000,
     gate(trigger: Trigger, thread, tickets) {
+      // A Routine is the agent's own schedule, not a sender's request: an inferred candidate while proactive work is on,
+      // and nothing at all while it is off. It is never explicit, so it can never make a Ticket on its own in `observe`.
+      if (trigger.source === 'routine' && trigger.meta.routine !== undefined) {
+        if (mode === 'off') return { admissible: false, reason: 'admission_ignored' }
+        const basis = { source: trigger.source, scope: trigger.meta, via: 'admission' as const, cell: 'unlistedUnaddressed' as const,
+          observation: { mode } }
+        return { admissible: true, strength: 'inferred', basis }
+      }
       if (!trigger.human) return machineGate(trigger)
       const allowed = allowedSender(settings, trigger.actor)
       const scope = listened(sources, trigger.source, trigger.meta)

@@ -19,6 +19,10 @@ import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
+import { usageAlert, type UsageLedger } from './usage.ts'
+import type { Passes } from './passes.ts'
+import type { Approvals } from './approvals.ts'
+import type { Routines } from './routines.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
 import { policyHistory } from './settings-history.ts'
@@ -34,10 +38,18 @@ export interface HttpHost {
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'prompt'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
+  /** What the managed Sessions' model requests spent, for the cost panel. */
+  readonly usage: Pick<UsageLedger, 'totals' | 'lines' | 'groups'>
+  /** The delay the next unprompted pass waits, so an idle machine's cadence is visible to the panel and to tests. */
+  readonly passes: Pick<Passes, 'interval'>
+  /** The schedules the agent runs on its own, which the panel lists and an operator edits. */
+  readonly routines: Pick<Routines, 'list' | 'save' | 'remove'>
+  /** The questions an irreversible command waits on, which the panel lists so a person can see what is stuck. */
+  readonly approvals: Pick<Approvals, 'list' | 'decide' | 'tally'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -46,6 +58,8 @@ export interface HttpHost {
   /** Resolved deployment; throws if read while waiting for setup (`!configured()`). */
   readonly deployment: Deployment
   readonly setupProblem?: SetupProblem | undefined
+  /** A setup retry that ran out left this rearm scheduled, so the panel shows the wait instead of an unexplained stop. */
+  readonly rearm?: { dueAt: string } | undefined
   readonly feishuProblem?: SetupProblem | undefined
   configured(): boolean
   links(): LinkTarget
@@ -53,6 +67,9 @@ export interface HttpHost {
   checkSetup(): void
   requestPass(): void
   models(): Promise<ModelCatalog>
+  compactTicket(id: string): Promise<{ compacted: boolean }>
+  /** Opens one turn on a Ticket's Session, the way a person's message does, so a compacted history can be read again. */
+  promptTicket(id: string, text: string): Promise<{ prompted: true }>
 }
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
@@ -98,6 +115,7 @@ function setupView(runtime: HttpHost) {
   const resolved = runtime.configured() ? runtime.deployment : undefined
   return {
     machine: machineView(runtime.machine), problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
+    rearm: runtime.rearm ?? null,
     accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
   }
 }
@@ -106,7 +124,7 @@ export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, passMs: runtime.passes.interval, health: runtime.health }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
@@ -156,6 +174,15 @@ function routes(runtime: HttpHost): Routes {
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
+    'GET usage': () => {
+      const now = new Date()
+      const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+      const today = runtime.usage.totals(midnight)
+      const alert = usageAlert(today)
+      const day = new Date(now.getTime() - 86_400_000)
+      return { today, last24Hours: runtime.usage.totals(day), bySession: runtime.usage.groups(day),
+        ...(alert === undefined ? {} : { alert }) }
+    },
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
@@ -192,7 +219,20 @@ function routes(runtime: HttpHost): Routes {
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
+    'POST tickets/:id/compact': ({ params }) => runtime.compactTicket(ticket(params.id)),
+    'POST tickets/:id/prompt': async ({ params, body }) => {
+      const text = (await body() as { text?: unknown }).text
+      if (typeof text !== 'string' || text.trim() === '') throw new RouteError(400, 'A prompt needs text to send')
+      return runtime.promptTicket(ticket(params.id), text)
+    },
     'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),
+    // Wake the main Session once. A human's message is the only other wake source, so without this route an operator cannot
+    // tell a refused wake (archived Session) from a host with nothing to deliver.
+    'POST selftest/wake': async () => {
+      await runtime.sessions.prompt(runtime.masterId, `wake-test:${Date.now()}`,
+        'Host self-test: this message verifies that this Session can be woken. Reply in one short sentence that you are available.', 'queue')
+      return { woken: true }
+    },
     'PUT settings/:block': async ({ params, body }) => {
       const block = SettingsBlockSchema.parse(params.block)
       const known = !block.startsWith('source:') || runtime.sources.instances().some(instance => `source:${instance.id}` === block)
@@ -204,6 +244,23 @@ function routes(runtime: HttpHost): Routes {
     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
+    'GET routines': () => ({ routines: runtime.routines.list() }),
+    'POST routines': async input => {
+      const body = z.object({ id: z.string().min(1).optional(), name: z.string().trim().min(1).max(120), cron: z.string().trim().min(1).max(120),
+        prompt: z.string().trim().min(1).max(4000), enabled: z.boolean().optional() }).parse(await input.body(16 * 1024))
+      try { return { routine: runtime.routines.save(body) } } catch (error) {
+        if (error instanceof RouteError) throw error
+        throw new RouteError(400, error instanceof Error ? error.message : String(error))
+      }
+    },
+    'POST routines/:id/remove': ({ params }) => ({ removed: runtime.routines.remove(params.id) }),
+    'GET approvals': () => ({ approvals: runtime.approvals.list(), tally: runtime.approvals.tally() }),
+    'POST approvals/:id/decide': async input => {
+      const request = z.object({ answer: z.enum(['approve', 'reject']) }).parse(await input.body(4 * 1024))
+      const approval = runtime.approvals.decide(input.params.id, request.answer, 'panel', 'panel')
+      if (approval === undefined) throw new RouteError(404, 'No approval is waiting under that id')
+      return { approval }
+    },
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))

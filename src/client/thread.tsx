@@ -108,10 +108,15 @@ function useThreadTimeline(key: string, target: string | undefined) {
 export function ThreadPage({ id, target }: { id: string; target?: string }) {
   const { t, call, navigate, notify } = usePanel()
   const [decisionsOpen, setDecisionsOpen] = useState(false)
+  const [approvalsOpen, setApprovalsOpen] = useState(false)
   const { data, error, reload, earlier } = useThreadTimeline(id, target)
   const requeue = useAction(async (trigger: string) => {
     const result = await call('POST triggers/:id/requeue', { id: trigger })
     if (!result.queued) notify(t('requeueAlready'))
+  }, { reload })
+  // Answering from a Thread walks the same path a card tap walks; the reload replaces the row with its decided state.
+  const decide = useAction(async (approval: string, answer: 'approve' | 'reject') => {
+    await call('POST approvals/:id/decide', { id: approval, body: { answer } })
   }, { reload })
   if (!data) return <><PageHead
     title={t('term.thread')} />{error instanceof ApiError && error.missing ? <Hint>{t('threadNotFound')}</Hint> : <LoadState
@@ -146,6 +151,28 @@ export function ThreadPage({ id, target }: { id: string; target?: string }) {
       onToggle={() => setDecisionsOpen(!decisionsOpen)}>
       <div className="dt-disclosure-body"><ul className="dt-list">{data.decisions.map(decision => <DecisionLine key={decision.id}
         decision={decision} />)}</ul></div>
+    </DisclosureRow>}
+    {data.approvals.length > 0 && <DisclosureRow icon={<Icon name="decision" />} title={t('threadApprovals',
+      { count: data.approvals.length })} open={approvalsOpen} onToggle={() => setApprovalsOpen(!approvalsOpen)}>
+      <div className="dt-disclosure-body"><ul className="dt-list">{data.approvals.map(item => <li key={item.id}
+        className="dt-row">
+        <div className="dt-row-main">
+          <span className="dt-row-meta">{t('approvalAsked', { time: when(item.askedAt, t('lang')) })}</span>{' '}
+          <span>{t('approvalRule', { rule: item.rule })}</span>{' '}
+          <Tag tone={item.state === 'approved' || item.state === 'used' ? 'success' : item.state === 'rejected' ? 'danger'
+            : 'neutral'}>{t(`approvalState.${item.state}`)}</Tag>
+          <code className="dt-code dt-clamp">{item.command}</code>
+          {item.decidedAt && <span className="dt-row-meta">{t('approvalDecided', { who: item.decidedBy ?? '?',
+            time: when(item.decidedAt, t('lang')) })}</span>}
+          {item.decidedVia && <span className="dt-row-meta">{t(`approvalVia.${item.decidedVia}`)}</span>}
+        </div>
+        {item.state === 'pending' && <div className="dt-row-actions">
+          <Button variant="outline" size="sm" disabled={decide.busy} onClick={() => { void decide.run(item.id, 'approve') }}>
+            {t('approve')}</Button>
+          <Button variant="outline" size="sm" disabled={decide.busy} onClick={() => { void decide.run(item.id, 'reject') }}>
+            {t('reject')}</Button>
+        </div>}
+      </li>)}</ul></div>
     </DisclosureRow>}
     {data.correlated.length > 0 && <Section title={t('term.correlation')}>
       <ul className="dt-plain-list">{data.correlated.map(item => <li key={item.key}>

@@ -36,7 +36,7 @@ Shutdown cancels turns, waits for passes, effects and agents, restores the proce
 
 | Part | Module | Does |
 | --- | --- | --- |
-| Setup | `src/app/setup.ts` | Resolves the repository and the accounts by probing their CLIs the way worker shells run them, writes and applies the workers' environment and command shims, and keeps the setup problems; Settings checks a changed account through it, and restarts through it, which runs setup again |
+| Setup | `src/app/setup.ts` | Resolves the repository and the accounts by probing their CLIs the way worker shells run them, writes and applies the workers' environment and command shims, and keeps the setup problems, trying a check again when the CLI's own output shows a lost connection rather than a refusal only the operator can clear (`passingSetup`), and running setup again on its own once the retries are spent; Settings checks a changed account through it, and restarts through it, which runs setup again |
 | Passes | `src/app/passes.ts` | One pass at a time, every two seconds and whenever a command asks: the due effects, then `Engine.evaluateDue`; a Source's Trigger reaches the Engine through it |
 | Outbox | `src/app/outbox.ts` | The Engine's `Outbox` port, and the only writer of the receipts: `send` keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
 | Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
@@ -244,7 +244,7 @@ Each model request binds the Session to the current prompt revision. The revisio
 
 | Glue | Translates |
 | --- | --- |
-| `src/app/runtime.ts` | The composition root: builds the parts with the interfaces they use, registers the routes and the Source host, and starts and stops dsh-superagent |
+| `src/app/runtime.ts` | The composition root: builds the parts with the interfaces they use, registers the routes and the Source host, announces a refusal in its thread once and warns once before a question lapses, and starts and stops dsh-superagent |
 | `src/app/notices.ts` | Domain events and worker reports into notices and relays for the main Session |
 | `src/app/tools/main.ts`, `src/app/tools/executor.ts` | Tool arguments of the main Session and the Executor Sessions into calls of the core classes, and their results into cards |
 | `src/app/http.ts`, `src/app/views/`, `src/app/api.ts` | HTTP requests into calls, and Store reads into the panel's views; `api.ts` types every route for the panel |
@@ -291,7 +291,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | Path | Responsibility |
 | --- | --- |
 | `src/index.ts` | The main plugin entry: reads the machine settings, starts the Runtime, and gives it the restart that a save of a Source's account uses |
-| `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
+| `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. `executable()` resolves a command name through `PATHEXT` on Windows, where the CLI the settings name is a `.cmd` or `.exe` file. A `Probe` takes the variables a CLI run needs, which `workerProbe` passes through the spawn request on Windows because that platform has no `env` executable. The code names no person, account or organization |
 | `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it and the English text the log, the main Session and the panel share |
 | `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation |
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
@@ -314,8 +314,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
-| `src/app/setup.ts` | Setup, and `setupChanged`, whether a save changes a field setup reads |
-| `src/app/passes.ts` | Passes, the pass scheduler |
+| `src/app/state-lock.ts` | `lockStateDir`, `LOCK_STALE_MS` and `LOCK_WAIT_MS`: the state directory lock, taken before the database opens, waiting out a lock a killed instance left behind instead of failing to mount, while an owner whose pid still runs is refused at once |
+| `src/app/setup.ts` | Setup, `setupChanged` (whether a save changes a field setup reads), `setupRetryMs` (the waits that try a check again when a passing network, not the account, broke it) `setupRearmMs` (how long the runtime waits before running setup again on its own) and `Setup.rearmDue`, the rearm already scheduled, which `/state` shows so a self-healing pause is not read as a dead runtime |
+| `src/app/passes.ts` | Passes, the pass scheduler: the base interval while work waits, doubling to thirty seconds while nothing does |
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
 | `src/app/notices.ts` | The main Session's notices and relays: `eventNotice`, `reportRelay`, `resultRelay` and `followupRelay` |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
@@ -329,32 +330,48 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
-| `src/app/sessions.ts` | Sessions |
+| `src/app/sessions.ts` | Sessions, including the worker shell guard that refuses a blocked rule and tells `Runtime` whether a card was sent or a person already answered no |
+| `src/app/wake-probe.ts` | `WakeProbe`: reads a Session's events to tell a wake that reached the model from one the host refused before any, for the `wake` health entry |
+| `src/app/self-heal.ts` | `SelfHeal`: takes the main Session out of the archived set when every wake is refused, writes an audit line and backs the registry file up first |
+| `src/app/command-gate.ts` | `commandName`, `blockedCommand` and `shimNames`: the command a blocked name resolves to behind a path or an executable suffix, and the shim files that make it fail in a worker's shell; `SHELL_RULES`, `shellRule` and `shellRefusal`: the shell lines a worker may not run at all — a download piped into an interpreter, an interpreter running a script fetched from the network, a force push, a repository delete — which the worker's tools guard refuses before the shell starts; `approvalRefusal` and `refusedRefusal`: the text a refused tool call returns when a card was sent, and when a person already answered no |
+| `src/app/usage.ts` | `UsageLedger`: one JSON line per model request from the `assistant/message` usage, the totals, cache share and estimated cost the cost panel reads, the same totals split by Session so the panel names where the money went, and the alert a cold prefix raises |
+| `src/app/compaction.ts` | `compactionSeam`: the host's `compaction` service behind a narrow local shape, so an operator can shrink one Ticket's Session now instead of waiting for the automatic token threshold |
+| `src/app/guard.ts` | `guardPatterns`, `guardFiles` and `ProcessGuard`: the second wall behind the gate — the shell rules and blocked names as plain-text patterns for `scripts/process-guard.ps1`, which kills a matching command line anywhere below the host process and writes what it killed to `$STATE/guard.log`; started when `DSH_SUPERAGENT_GUARD=1` |
+| `src/app/facts.ts` | `TicketFacts`, `FactCards` and `renderFacts`: the card a ticket keeps on disk (`$STATE/tickets/<id>/facts.yaml`), re-injected as a `TICKET-FACTS` section on every request so a compacted history reads its bounds again |
+| `src/app/untrusted.ts` | `scanUntrusted`, `scanThread` and `scanView`: the rules that flag injection-shaped external text (override phrasing, merge-without-review, impersonation, hidden or encoded payloads, secret reads, tool imitation), the thread-wide score, and the field an assessment carries |
+| `src/app/approvals.ts` | `ApprovalRequest`, `Approvals`, `approvalAnswer` and `approvalCard`: the questions an irreversible command waits on (a force push or a repository delete), the ten-minute deadline that makes a forgotten card stop granting anything, the one-command grant the retry spends, the listing and the wait summary the health entry and the panel read, the refusal that stands for ten minutes so a worker told no stops asking, and the interactive card whose button values carry the answer, and the questions close enough to their deadline to warn about once, with a tally of how the closed ones ended and a record of whether a person answered in the panel or on the card |
+| `src/app/card-consume.ts` | `watchCards`, `handleCardLine` and `cardAction`: the long-connection consumer for `card.action.trigger`, which turns a click into an awarded approval and reconnects with the same backoff as the Feishu Source's event consumer |
+| `src/app/routines.ts` | `Routine`, `parseCron`, `nextRun` and `Routines`: the cron expression a Routine keeps (nicknames, lists, ranges and steps), the next minute it fires, and the trigger a due Routine hands the intake as an inferred candidate — never as a sender's request |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
-| `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
+| `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard`, which carries the injection screen so a flagged thread is flagged before any Eval runs |
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
 | `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role |
-| `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
+| `src/app/tools/tool.ts` | The `Tool` type and `AcknowledgementSchema`, the shared shape every tool of both roles is built from |
+| `src/app/tools/read.ts` | `readTool`: the `orchestrator_read` of both roles, kept apart so the resource grammar does not import the tool primitives back |
 | `src/app/tools/main.ts` | The main Session's tools |
-| `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/executor.ts` | An Executor Session's tools, plus `orchestrator_browser` when the profile opts a ticket into a browser |
+| `src/app/tools/browser.ts` | `orchestrator_browser`: open, snapshot, click and type through the accessibility tree, the token saving each answer reports, and the point after which a page that keeps refusing sends the worker back to a person instead |
+| `src/app/browser.ts` | The accessibility tree behind the browser tool: rendering, the screenshot cost it is measured against, and a headless Chromium driven over the DevTools protocol on a WebSocket Node already provides |
+| `src/app/browser-sessions.ts` | One browser per ticket, opened on first use, closed by the worker or when the profile stops, plus the run of failures that says this page needs a person |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
 | `src/app/views/tickets.ts` | The Ticket lists by stage, a Ticket's page, the Mandate basis facts and the Executor's load |
-| `src/app/views/threads.ts` | The Thread lists, a Thread's timeline, the search and the Decision list |
+| `src/app/views/threads.ts` | The Thread lists, a Thread's timeline, the search, the Decision list and the approvals asked for its Tickets |
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
-| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions`; its prepare command runs through `shellLine`, which is how a Windows host without `sh` prepares a workspace |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
+| `src/infra/launch.ts` | The command a CLI is started with: `launchCommand` sends a batch file through `cmd.exe`, which is what a shell does too, and names the `.exe` a value with syntax in it needs instead; `shellLine` runs a shell script — the prepare command among them — through `sh -c` or, on Windows, through `cmd.exe` with its lines joined by `&&` |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
@@ -379,9 +396,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
-| `src/client/overview.tsx` | The overview |
+| `src/client/overview.tsx` | The overview, where approvals waiting on a person are answered and a rearm the runtime scheduled reads as recovery rather than as a problem to fix |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
-| `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
+| `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline and the approvals asked for it, which a person answers here too and where they see which door the earlier answers came through, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
 | `src/client/prompts.tsx` | The Prompts settings: the page owns the view it read and its editor the draft, and the Edit, Full prompt and History tabs render from them; a built-in part's editor shows a changed default and keeps or drops the override |
@@ -401,8 +418,15 @@ Some generic modules still refer directly to GitHub or Feishu:
 
 ## Tests
 
+Suites that drive POSIX shell stand-ins — `tests/service-script.spec.ts` and the parts of `tests/deployment.spec.ts`,
+`tests/environment.spec.ts`, `tests/sources.spec.ts` and `tests/commands.spec.ts` that spawn one — are skipped on
+Windows, where those stand-ins cannot run; `tests/service-task.spec.ts` covers the Windows start paths — a logon
+task, a per-user Run key and a minute watchdog that restarts the profile — and `tests/environment-win.spec.ts` the
+shims a Windows shell does run.
+
 | Test | Covers |
 | --- | --- |
+| `tests/command-gate.spec.ts` | The command gate: a blocked name reached through a path or an uppercase suffix, the shims written for each spelling, a worker's shell failing on them, and the shell lines refused by rule with the reason the model reads |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
@@ -424,21 +448,41 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
+| `tests/wake-probe.spec.ts` | `WakeProbe`: a blocked wake without a model request, a later model turn clearing it, and ignored Sessions and event order |
+| `tests/self-heal.spec.ts` | `SelfHeal`: unarchiving with its audit line, staying put when not archived, the throttle and the switch |
+| `tests/usage.spec.ts` | `UsageLedger`: one line per request, ignored events without usage, the totals and cache share over a window, the cost estimate at list prices, and the alert a cold prefix raises |
+| `tests/state-lock.spec.ts` | The state directory lock: a free directory taken at once, a lock left by a killed instance reclaimed, and a live owner still ending in the refusal after the wait |
+| `tests/facts.spec.ts` | Fact cards: the rendered block, the file round trip, the pull request read from a ticket's own follows, the write/peek/read path, the truncation of a runaway card, and a hand-edited file that is not a card |
+| `tests/guard.spec.ts` | The process guard rules: every shell rule carried as a pattern, each blocked command as a word-boundary pattern that still matches a path or a suffix, and no command rule when nothing is blocked |
+| `tests/golden.spec.ts` | The golden cases: a Feishu mention to a candidate, an accepted candidate with its worker Session and fact card, a worker report ending its Ticket, the command gate refusing a blocked command, an archived main Session repaired, a due Routine firing without a ticket, and the pass backoff |
+| `tests/untrusted.spec.ts` | Untrusted input: an ordinary body passing clean, a Chinese and an English override, zero-width and HTML-comment hideouts, encoded and exfiltration and tool-imitation signals, the thread budget, and the payload field |
+| `tests/approvals.spec.ts` | Approval questions: ten minutes to answer, one grant per question, the refusal that keeps a worker from asking twice, the questions close enough to lapse to warn about, and the tally of answers | Approvals: one question per ticket and rule, the deadline that ends it, a grant spent by one command and only for its own ticket and rule, refusals and late answers, the sweep that retires unanswered cards, the card's button values, the callback reader, the consumer's answer path, and its backoff, the newest-first listing, and the wait summary that counts only what still waits |
+| `tests/approval-round-trip.spec.ts` | The approval round trip: a card asked for a force push and the approved retry runs once, a rejected command stays refused without a second card and its thread hears once, a question about to lapse is warned about once, and a download piped into a shell is refused with no card | The approval round trip a live chat could not replay: a force push refused, a card asked, the approved retry running once and the grant spent, a rejected command staying refused, and an unapprovable rule that never asks |
+| `tests/routines.spec.ts` | Routines: field, list, range and step parsing, the nicknames, the field-count and range and step refusals, the next run across a day-and-weekday schedule, a schedule that never fires, one fire per due minute with its next run, a paused Routine, a failed hand-off that still keeps the schedule, removal, and the name and prompt refusals |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
+| `tests/passes.spec.ts` | The pass scheduler's backoff: the base interval while work waits, doubling to thirty seconds while nothing does, and back to the base when work arrives |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
-| `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
+| `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to, and the approvals a Thread lists |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
 | `tests/migration.spec.ts` | The schema 11 migration: every stored record in its current shape, and the refusal of older schemas |
 | `tests/store.spec.ts` | Repositories and their working sets, in SQLite as in memory, the kv area, with every key of `KV` spelled only in `src/kv.ts` and the migration, settings history and queries |
+| `tests/prompt-prefix.spec.ts` | The prompt head every Session shares: its hash stays pinned so an edit cannot quietly re-price a warm cache, and the per-Ticket and Policy sections stay below it |
 | `tests/prompts.spec.ts` | Prompt validation, assembly and versions |
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
+| `tests/deployment-win.spec.ts` | `executable()` on Windows: the `.cmd` and `.exe` files PATHEXT puts behind a bare command name, a name that already carries its extension, and the directory setup must ignore |
+| `tests/launch.spec.ts` | The command a CLI is started with: an executable and a shell script started as themselves, a batch file through the shell that can start it, and the argument a batch file cannot carry reported where it happens |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
+| `tests/service-task.spec.ts` | `scripts/dsh-superagent-service.ps1` on Windows: the logon task, WinSW service, per-user Run key and minute watchdog plans it prints without running, and the one status line it reads from the live profile |
+| `tests/browser.spec.ts` | The accessibility tree as YAML: refs on controls only, ignored nodes skipped, quoting, truncation, and the cost of the tree against a screenshot of the same viewport |
+| `tests/browser-edge.spec.ts` | Three steps on a real page in the machine's own Edge: open, type, click, read the answer back, and the tree staying under two fifths of the screenshot cost |
+| `tests/browser-tools.spec.ts` | The browser tool without a browser: one page per ticket, a closed page forgotten, every action's refusals, the token saving in each answer, and the third failure that names the hand-back tool |
+| `tests/environment-win.spec.ts` | The worker shims on Windows: the batch files a Windows shell can run, a blocked command failing there with the agent's login, and `gh` forwarded with the caller's arguments after the shim directory leaves PATH |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
-| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
+| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route, including the approvals a Thread page lists and the Sessions the cost panel splits the day between |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |

@@ -260,6 +260,22 @@ it('shows a follow-up that reached a ticket as delivered, the tickets that hande
   expect(triggerView(snapshot(host), store.triggers.get('f2')!).disposition.handbacks[0]?.title).toBe('Fix')
 })
 
+it('lists on a Thread the approvals asked for its subscribed Tickets, oldest first, and none of another Ticket\'s', () => {
+  const host = views()
+  store.threads.save({ key: 'feishu:oc_1:om_root', ref: { source: 'feishu', id: 'oc_1:om_root' }, createdAt: at, subscriptions: ['t1'],
+    correlated: [], pending: [], meta: {} })
+  const ask = (id: string, ticketId: string, rule: string, state: 'pending' | 'approved', at: string) => store.approvals.save({ id, ticketId,
+    rule, command: 'git push --force origin main', chatId: 'oc_1', askedAt: at, expiresAt: '2026-09-20T00:10:00Z', state,
+    ...(state === 'approved' ? { decidedAt: '2026-09-20T00:02:00Z', decidedBy: 'Alice' } : {}) })
+  ask('a1', 't1', 'force_push', 'pending', '2026-09-20T00:00:00Z')
+  ask('a2', 't2', 'repo_delete', 'approved', '2026-09-20T00:01:00Z')
+  ask('a3', 't1', 'repo_delete', 'approved', '2026-09-20T00:03:00Z')
+  const listed = threadDetail(host, 'feishu:oc_1:om_root', undefined, 50)!.approvals
+  expect(listed.map(item => [item.id, item.state, item.decidedBy ?? null])).toEqual([['a1', 'pending', null], ['a3', 'approved', 'Alice']])
+  expect(listed[1]!.command).toBe('git push --force origin main')
+  expect(listed[0]!.expiresAt).toBe('2026-09-20T00:10:00Z')
+})
+
 it('names a bot\'s Mandate as a bot once the Policy no longer lists it', () => {
   const host = views()
   const mandate = { strength: 'inferred' as const, policyVersion: 'v', basis: { via: 'bot' as const,

@@ -32,6 +32,20 @@ describe('account-isolated operations', () => {
   it('refuses Feishu commands when the deployment has no Feishu bot', async () => {
     await expect(new Commands(() => testDeployment({ feishu: undefined }), {}, new AbortController().signal).lark(['im', '+chat-list'])).rejects.toThrow('The Feishu Source has no working bot CLI')
   })
+  it('asks Feishu again when a reply is cut short instead of reporting a parse error', async () => {
+    const commands = new Commands(() => deployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run')
+      .mockResolvedValueOnce('{"ok":true,"data":{"items":[\n')
+      .mockResolvedValueOnce('{"ok":true,"data":{"items":[]}}')
+    await expect(commands.lark<{ items: unknown[] }>(['im', '+chat-list'])).resolves.toEqual({ items: [] })
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+  it('reports a Feishu reply that stays cut short after the retry, without dumping the whole document', async () => {
+    const commands = new Commands(() => deployment, {}, new AbortController().signal)
+    vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{"items":[1,2,3')
+    await expect(commands.lark(['im', '+chat-list'])).rejects.toMatchObject({ exitCode: 1 })
+    await expect(commands.lark(['im', '+chat-list'])).rejects.toThrow('Feishu returned a truncated reply: {"ok":true,"data":{"items":[1,2,3')
+  })
   it('reconciles an uncertain GitHub send with its stable marker', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
     vi.spyOn(commands,'pages').mockResolvedValue([{ body:'<!-- dsh-superagent:stable-operation -->',user:{login:'agent-bot'} }])
@@ -183,6 +197,9 @@ it('names only the program and how it ended when a command prints no diagnostics
 })
 it('reports failures as CliError with the code the CLI names and the exit status', async () => {
   const notFound = commandError({ stderr: 'gh: Not Found (HTTP 404)\n', code: 1 })
+  // A shell that caught a signal reports 128 + N; Windows has no signal to report.
+  expect(commandError({ code: 143 })).toMatchObject({ message: 'command was stopped by SIGTERM' })
+  expect(commandError({ code: 124 })).toMatchObject({ message: 'command exited with code 124' })
   expect(notFound).toBeInstanceOf(CliError)
   expect(notFound).toMatchObject({ message: 'gh: Not Found (HTTP 404)', code: 404, exitCode: 1 })
   expect(commandError({ stderr: JSON.stringify({ error: { code: 230011, message: 'The message is recalled' } }),
