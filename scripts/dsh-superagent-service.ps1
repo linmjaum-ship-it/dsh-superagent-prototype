@@ -37,6 +37,11 @@
   A Sandboxie box name, for -Method supervise. The whole instance, the workers it starts included, then runs
   inside that box; the box must already allow the paths the profile writes through OpenFilePath. Empty starts
   the profile on the host, as before.
+
+.PARAMETER LogDir
+  Where the resident loop keeps its own log and the box launcher, for -Method supervise. A service account has no
+  LOCALAPPDATA, so the default falls back to ProgramData; name a directory the box already allows through
+  OpenFilePath, or the launcher lands in the sandbox and the box never finds it.
 #>
 [CmdletBinding()]
 param(
@@ -50,10 +55,20 @@ param(
   [string]$WinSW = 'winsw.exe',
   [int]$Port = 3082,
   [string]$StateDir = '',
-  [string]$Box = ''
+  [string]$Box = '',
+  [string]$LogDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+# A service account has no LOCALAPPDATA, so the loop's own log and the box launcher need a home.
+function Resolve-LogDir([string]$Given) {
+  if ($Given -ne '') { return $Given }
+  if ($env:LOCALAPPDATA) { return (Join-Path $env:LOCALAPPDATA 'dsh-superagent') }
+  if ($env:ProgramData) { return (Join-Path $env:ProgramData 'dsh-superagent') }
+  return (Join-Path $env:TEMP 'dsh-superagent')
+}
+$logHome = Resolve-LogDir $LogDir
 
 function Resolve-Dsh([string]$Given) {
   if ($Given -ne '') { return $Given }
@@ -77,7 +92,7 @@ $executeArguments = if ($dshPath -match '\.ps1$') { '-NoProfile -ExecutionPolicy
 # A box wraps the whole instance, workers included. Sandboxie starts a command line rather than a program, so the
 # profile runs through a launcher this script writes and the box is named once.
 $startExe = 'C:\Program Files\Sandboxie-Plus\Start.exe'
-$boxLauncher = Join-Path (Join-Path $env:LOCALAPPDATA 'dsh-superagent') 'box-launch.cmd'
+$boxLauncher = Join-Path $logHome 'box-launch.cmd'
 if ($Box) {
   $execute = $startExe
   $executeArguments = '/box:' + $Box + ' /silent cmd.exe /d /s /c "' + $boxLauncher + '"'
@@ -90,7 +105,9 @@ function Write-BoxLauncher {
     '@echo off',
     'setlocal',
     'set "ELECTRON_RUN_AS_NODE=1"',
-    ('"' + $dshPath + '" ' + $arguments + ' > "' + (Join-Path $dir 'box-run.log') + '" 2>&1')
+    # A fresh file per launch: a log a crashed instance still holds open cannot be reopened, and a silent
+    # redirection failure looks exactly like an instance that never starts.
+    ('"' + $dshPath + '" ' + $arguments + ' > "' + (Join-Path $dir ('box-run-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')) + '" 2>&1')
   )
   Set-Content -Path $boxLauncher -Value $body -Encoding Ascii
 }
@@ -98,6 +115,7 @@ $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $keepalive = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + $PSCommandPath + ' -Action keepalive -Method startup'
 # The resident loop starts the same way, at logon, and restarts the profile itself on every tick.
 $supervise = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + $PSCommandPath + ' -Action supervise -Method startup'
+if ($LogDir -ne '') { $supervise = $supervise + ' -LogDir "' + $LogDir + '"' }
 if ($StateDir) { $supervise = $supervise + ' -StateDir "' + $StateDir + '"' }
 $superviseStart = "Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','" + $PSCommandPath + "','-Action','supervise'"
 if ($StateDir) { $superviseStart = $superviseStart + ",'-StateDir','" + $StateDir + "'" }
@@ -217,10 +235,21 @@ if ($Action -eq 'supervise') {
   # startup check wants a crash back inside thirty seconds. The probe is the state API and not the port, because a
   # start that lost the state lock still listens and answers 404 on every orchestrator route: a port probe calls
   # that healthy and never restarts it.
-  $logDir = Join-Path $env:LOCALAPPDATA 'dsh-superagent'
+  $logDir = $logHome
   $null = New-Item -ItemType Directory -Force -Path $logDir
   $log = Join-Path $logDir 'supervise.log'
   $lock = if ($StateDir) { $StateDir + '.lock' } else { '' }
+  # One loop only. Two loops probe the same port and both clear the same lock, so a single crash gets answered
+  # twice and the second start fights the first for the state directory.
+  $rivals = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+    $_.ProcessId -ne $PID -and $_.CommandLine -and
+    $_.CommandLine -like ('*' + $PSCommandPath + '*') -and
+    $_.CommandLine -like '*-Action supervise*'
+  })
+  if ($rivals.Count -gt 0) {
+    Add-Content -Path $log -Value ((Get-Date).ToString('o') + " another supervise loop (" + $rivals[0].ProcessId + ") already watches port $Port; leaving it to that one")
+    exit 0
+  }
   Add-Content -Path $log -Value ((Get-Date).ToString('o') + " supervise started every 10s on port $Port")
   $degraded = 0
   while ($true) {
@@ -262,14 +291,15 @@ if ($Action -eq 'supervise') {
         $age = ((Get-Date) - (Get-Item -LiteralPath $lock).LastWriteTime).TotalSeconds
       }
       # The age alone cannot tell a boot in progress from a dead one, because a live instance refreshes the lock's
-      # write time; only the process list can. A lock ninety seconds old with a profile process still alive is a
-      # boot that hung, and that one is worth replacing.
+      # write time every few seconds. A lock fifteen seconds old with nothing answering the port is one whose
+      # instance died: the launcher that stayed behind after its profile was killed keeps the process list looking
+      # alive, and waiting the old ninety seconds only turned a ten second restart into a minute.
       $alive = @(Get-CimInstance Win32_Process | Where-Object {
         $_.ProcessId -ne $PID -and $_.CommandLine -and
         $_.CommandLine -like ('*' + $profileTag + '*') -and
         $_.CommandLine -notlike '*-Action supervise*'
       }).Count -gt 0
-      if ($lock -and (Test-Path -LiteralPath $lock) -and $alive -and $age -lt 90) {
+      if ($lock -and (Test-Path -LiteralPath $lock) -and $alive -and $age -lt 15) {
         Add-Content -Path $log -Value ((Get-Date).ToString('o') + " waiting on the instance that holds " + $lock + ": " + [int]$age + "s old and still a process")
       } else {
         if ($lock -and (Test-Path -LiteralPath $lock)) {
