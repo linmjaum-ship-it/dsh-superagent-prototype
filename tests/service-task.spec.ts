@@ -65,6 +65,7 @@ describe.skipIf(process.platform !== 'win32')('dsh-superagent-service.ps1', () =
     expect(code).toBe(0)
     expect(output).toContain('method=supervise')
     expect(output).toContain('probes the port every ten seconds')
+    expect(output).toContain('leaves the state lock alone while a process still holds the profile')
     expect(output).toContain('-Action supervise -Method startup')
     expect(output).toContain("New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'")
     expect(output.split('\n').filter(line => line.startsWith('+ '))).toEqual([])

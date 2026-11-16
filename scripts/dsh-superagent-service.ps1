@@ -221,13 +221,32 @@ if ($Action -eq 'supervise') {
         $degraded = 0
       }
     } else {
-      # Nothing is serving, so any lock beside the state directory belongs to a process that is gone.
+      # Nothing answers yet. A lock this young belongs to a start that is still mounting, either the one this loop
+      # just made or the one the Run key made at logon: removing it makes that start fail to mount while a second
+      # instance fights for the port, which is how two boots ended up sharing one state directory. Only a lock older
+      # than the grace, left by a process that died, counts as stale.
+      $age = -1.0
       if ($lock -and (Test-Path -LiteralPath $lock)) {
-        Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue
-        Add-Content -Path $log -Value ((Get-Date).ToString('o') + " removed stale $lock")
+        $age = ((Get-Date) - (Get-Item -LiteralPath $lock).LastWriteTime).TotalSeconds
       }
-      Start-Process -FilePath $execute -ArgumentList $executeArguments -WindowStyle Hidden
-      Add-Content -Path $log -Value ((Get-Date).ToString('o') + " started $execute $executeArguments")
+      # The age alone cannot tell a boot in progress from a dead one, because a live instance refreshes the lock's
+      # write time; only the process list can. A lock ninety seconds old with a profile process still alive is a
+      # boot that hung, and that one is worth replacing.
+      $alive = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ProcessId -ne $PID -and $_.CommandLine -and
+        $_.CommandLine -like ('*--profile ' + $Profile + '*') -and
+        $_.CommandLine -notlike '*-Action supervise*'
+      }).Count -gt 0
+      if ($lock -and (Test-Path -LiteralPath $lock) -and $alive -and $age -lt 90) {
+        Add-Content -Path $log -Value ((Get-Date).ToString('o') + " waiting on the instance that holds " + $lock + ": " + [int]$age + "s old and still a process")
+      } else {
+        if ($lock -and (Test-Path -LiteralPath $lock)) {
+          Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue
+          Add-Content -Path $log -Value ((Get-Date).ToString('o') + " removed $lock, which no running instance holds")
+        }
+        Start-Process -FilePath $execute -ArgumentList $executeArguments -WindowStyle Hidden
+        Add-Content -Path $log -Value ((Get-Date).ToString('o') + " started $execute $executeArguments")
+      }
       $degraded = 0
     }
     Start-Sleep -Seconds 10
@@ -254,6 +273,8 @@ if ($Action -eq 'plan') {
   } elseif ($Method -eq 'supervise') {
     Write-Output '# A per-user resident loop needs no administrator rights: it probes the port every ten seconds and'
     Write-Output '# starts the profile again when the port stops answering, so a crash comes back in about ten seconds.'
+    Write-Output '# It leaves the state lock alone while a process still holds the profile, so a start that is mounting is'
+    Write-Output '# not mistaken for a crash, and it clears the lock a killed instance left behind.'
   } elseif ($Method -eq 'watchdog') {
     Write-Output '# A per-user task every minute needs no administrator rights: it starts the profile again when the port'
     Write-Output '# stops answering, so a crash comes back within about a minute rather than at the next logon.'
